@@ -640,6 +640,7 @@ impl Vm {
             &cpu_manager,
             &device_manager,
             &config,
+            &numa_nodes,
             &hypervisor,
             console_info.as_ref(),
             console_resize_pipe.as_ref(),
@@ -867,6 +868,8 @@ impl Vm {
         cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
+        #[cfg(feature = "sev_snp")] numa_nodes: &NumaNodes,
+        #[cfg(not(feature = "sev_snp"))] _numa_nodes: &NumaNodes,
         hypervisor: &Arc<dyn hypervisor::Hypervisor>,
         console_info: Option<&ConsoleInfo>,
         console_resize_pipe: Option<&Arc<File>>,
@@ -902,6 +905,7 @@ impl Vm {
                 cpu_manager,
                 device_manager,
                 config,
+                numa_nodes,
                 console_info,
                 console_resize_pipe,
                 original_termios,
@@ -985,11 +989,15 @@ impl Vm {
         cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
+        numa_nodes: &NumaNodes,
         console_info: Option<&ConsoleInfo>,
         console_resize_pipe: Option<&Arc<File>>,
         original_termios: &Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
+        #[cfg(not(feature = "fw_cfg"))]
+        let _ = numa_nodes;
+
         // Create boot vCPUs before SEV-SNP initialization
         cpu_manager
             .lock()
@@ -1000,19 +1008,6 @@ impl Vm {
         // Initialize SEV-SNP - transitions guest into secure state
         vm.sev_snp_init(Self::get_default_sev_snp_guest_policy())
             .map_err(Error::InitializeSevSnpVm)?;
-
-        // Load payload for SEV-SNP (IGVM parser needs cpu_manager for cpuid)
-        let load_payload_handle = if snapshot.is_none() {
-            Self::load_payload_async(
-                memory_manager,
-                config,
-                #[cfg(feature = "igvm")]
-                cpu_manager,
-                true,
-            )?
-        } else {
-            None
-        };
 
         // Create interrupt controller and devices for MSHV
         let ic = device_manager
@@ -1037,6 +1032,54 @@ impl Vm {
 
         #[cfg(feature = "fw_cfg")]
         Self::create_fw_cfg_if_enabled(config, device_manager)?;
+
+        #[cfg(target_arch = "x86_64")]
+        let _fw_cfg_acpi_hash = {
+            #[cfg(feature = "fw_cfg")]
+            {
+                let (payload, tpm_enabled) = {
+                    let config = config.lock().unwrap();
+                    (config.payload.clone(), config.tpm.is_some())
+                };
+                payload.as_ref().and_then(|payload| {
+                    Self::generate_fw_cfg_acpi_hash(
+                        payload,
+                        device_manager,
+                        cpu_manager,
+                        memory_manager,
+                        numa_nodes,
+                        tpm_enabled,
+                        true,
+                    )
+                })
+            }
+            #[cfg(not(feature = "fw_cfg"))]
+            {
+                None::<String>
+            }
+        };
+
+        #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
+        if let Some(acpi_hash) = _fw_cfg_acpi_hash.as_deref() {
+            let mut config = config.lock().unwrap();
+            if let Some(payload) = config.payload.as_mut() {
+                Self::ensure_cmdline_param(payload, "acpi_hash", acpi_hash);
+            }
+        }
+
+        // Load payload for SEV-SNP after devices exist so the derived ACPI digest
+        // matches the final AML exposed via fw_cfg.
+        let load_payload_handle = if snapshot.is_none() {
+            Self::load_payload_async(
+                memory_manager,
+                config,
+                #[cfg(feature = "igvm")]
+                cpu_manager,
+                true,
+            )?
+        } else {
+            None
+        };
 
         Ok(load_payload_handle)
     }
@@ -1130,7 +1173,40 @@ impl Vm {
         fw_cfg_config: &FwCfgConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
+        #[cfg(target_arch = "x86_64")] cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
+        #[cfg(target_arch = "x86_64")] memory_manager: &Arc<Mutex<MemoryManager>>,
+        #[cfg(target_arch = "x86_64")] numa_nodes: &NumaNodes,
+        #[cfg(all(target_arch = "x86_64", feature = "sev_snp"))] sev_snp_enabled: bool,
     ) -> Result<()> {
+        // Inject acpi_hash into cmdline if needed (for boot() path where
+        // init_sev_snp's ensure_cmdline_param may not have run).
+        #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
+        {
+            let (payload, tpm_enabled) = {
+                let config = config.lock().unwrap();
+                (config.payload.clone(), config.tpm.is_some())
+            };
+            if let Some(acpi_hash) = payload.as_ref().and_then(|payload| {
+                Self::generate_fw_cfg_acpi_hash(
+                    payload,
+                    device_manager,
+                    cpu_manager,
+                    memory_manager,
+                    numa_nodes,
+                    tpm_enabled,
+                    #[cfg(feature = "sev_snp")]
+                    sev_snp_enabled,
+                    #[cfg(not(feature = "sev_snp"))]
+                    false,
+                )
+            }) {
+                let mut config = config.lock().unwrap();
+                if let Some(payload) = config.payload.as_mut() {
+                    Self::ensure_cmdline_param(payload, "acpi_hash", &acpi_hash);
+                }
+            }
+        }
+
         let mut e820_option: Option<usize> = None;
         if fw_cfg_config.e820 {
             e820_option = Some(config.lock().unwrap().memory.size as usize);
@@ -1412,6 +1488,65 @@ impl Vm {
 
         info!("Initramfs loaded: address = 0x{:x}", address.0);
         Ok(arch::InitramfsConfig { address, size })
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
+    fn cmdline_has_param(payload: &PayloadConfig, key: &str) -> bool {
+        payload.cmdline.as_ref().is_some_and(|cmdline| {
+            cmdline.split_whitespace().any(|param| {
+                if let Some((param_key, _)) = param.split_once('=') {
+                    param_key == key
+                } else {
+                    param == key
+                }
+            })
+        })
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
+    fn ensure_cmdline_param(payload: &mut PayloadConfig, key: &str, value: &str) {
+        if Self::cmdline_has_param(payload, key) {
+            return;
+        }
+
+        let param = format!("{key}={value}");
+        match payload.cmdline.as_mut() {
+            Some(cmdline) if !cmdline.is_empty() => {
+                cmdline.push(' ');
+                cmdline.push_str(&param);
+            }
+            Some(cmdline) => cmdline.push_str(&param),
+            None => payload.cmdline = Some(param),
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "fw_cfg"))]
+    fn generate_fw_cfg_acpi_hash(
+        payload: &PayloadConfig,
+        device_manager: &Arc<Mutex<DeviceManager>>,
+        cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
+        memory_manager: &Arc<Mutex<MemoryManager>>,
+        numa_nodes: &NumaNodes,
+        tpm_enabled: bool,
+        sev_snp_enabled: bool,
+    ) -> Option<String> {
+        let fw_cfg_config = payload.fw_cfg_config.as_ref()?;
+        if !sev_snp_enabled
+            || payload.igvm.is_none()
+            || !fw_cfg_config.acpi_tables
+            || !fw_cfg_config.cmdline
+            || Self::cmdline_has_param(payload, "acpi_hash")
+        {
+            return None;
+        }
+
+        Some(crate::acpi::create_acpi_tables_fw_cfg_digest(
+            device_manager,
+            cpu_manager,
+            memory_manager,
+            numa_nodes,
+            tpm_enabled,
+        ))
     }
 
     pub fn generate_cmdline(
@@ -2732,27 +2867,44 @@ impl Vm {
 
         #[cfg(feature = "fw_cfg")]
         {
-            let fw_cfg_enabled = self
-                .config
-                .lock()
-                .unwrap()
-                .payload
-                .as_ref()
-                .is_some_and(|p| p.fw_cfg_config.is_some());
-            if fw_cfg_enabled {
-                let fw_cfg_config = self
-                    .config
-                    .lock()
-                    .unwrap()
+            let (fw_cfg_enabled, fw_cfg_config, tpm_enabled) = {
+                let config = self.config.lock().unwrap();
+                let fw_cfg_enabled = config
                     .payload
                     .as_ref()
-                    .map(|p| p.fw_cfg_config.clone())
-                    .unwrap_or_default()
-                    .ok_or(Error::VmMissingConfig)?;
-                Self::populate_fw_cfg(&fw_cfg_config, &self.device_manager, &self.config)?;
+                    .is_some_and(|p| p.fw_cfg_config.is_some());
+                let fw_cfg_config = if fw_cfg_enabled {
+                    Some(
+                        config
+                            .payload
+                            .as_ref()
+                            .and_then(|p| p.fw_cfg_config.clone())
+                            .ok_or(Error::VmMissingConfig)?,
+                    )
+                } else {
+                    None
+                };
+                (fw_cfg_enabled, fw_cfg_config, config.tpm.is_some())
+            };
+            #[cfg(all(target_arch = "x86_64", feature = "sev_snp"))]
+            let sev_snp_enabled = self.config.lock().unwrap().is_sev_snp_enabled();
+            if fw_cfg_enabled {
+                let fw_cfg_config = fw_cfg_config.ok_or(Error::VmMissingConfig)?;
+                Self::populate_fw_cfg(
+                    &fw_cfg_config,
+                    &self.device_manager,
+                    &self.config,
+                    #[cfg(target_arch = "x86_64")]
+                    &self.cpu_manager,
+                    #[cfg(target_arch = "x86_64")]
+                    &self.memory_manager,
+                    #[cfg(target_arch = "x86_64")]
+                    &self.numa_nodes,
+                    #[cfg(all(target_arch = "x86_64", feature = "sev_snp"))]
+                    sev_snp_enabled,
+                )?;
 
                 if fw_cfg_config.acpi_tables {
-                    let tpm_enabled = self.config.lock().unwrap().tpm.is_some();
                     crate::acpi::create_acpi_tables_for_fw_cfg(
                         &self.device_manager,
                         &self.cpu_manager,

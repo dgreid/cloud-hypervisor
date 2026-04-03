@@ -111,6 +111,12 @@ const FW_CFG_FILENAME_TABLE_LOADER: &str = "etc/table-loader";
 const FW_CFG_FILENAME_RSDP: &str = "acpi/rsdp";
 const FW_CFG_FILENAME_ACPI_TABLES: &str = "acpi/tables";
 
+pub struct AcpiFwCfgBlobs {
+    pub table_loader: Vec<u8>,
+    pub rsdp: Vec<u8>,
+    pub tables: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub enum FwCfgContent {
     Bytes(Vec<u8>),
@@ -343,7 +349,18 @@ impl AcpiTable {
 
 // Creates fw_cfg items used by firmware to load and verify Acpi tables
 // https://github.com/qemu/qemu/blob/master/hw/acpi/bios-linker-loader.c
-fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
+pub fn create_acpi_blobs(
+    rsdp: Rsdp,
+    tables: Vec<u8>,
+    table_checksums: Vec<(usize, usize)>,
+    table_pointers: Vec<usize>,
+) -> AcpiFwCfgBlobs {
+    let acpi_table = AcpiTable {
+        rsdp,
+        tables,
+        table_checksums,
+        table_pointers,
+    };
     let mut table_loader_bytes: Vec<u8> = Vec::new();
     let allocate_rsdp = Allocate {
         command: COMMAND_ALLOCATE,
@@ -399,14 +416,33 @@ fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
     table_loader_bytes.extend(checksum_rsdp.as_bytes());
     table_loader_bytes.extend(checksum_rsdp_ext.as_bytes());
 
+    let (rsdp, tables) = acpi_table.take();
+    AcpiFwCfgBlobs {
+        table_loader: table_loader_bytes,
+        rsdp: rsdp.as_bytes().to_owned(),
+        tables,
+    }
+}
+
+fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
+    let AcpiFwCfgBlobs {
+        table_loader,
+        rsdp,
+        tables,
+    } = create_acpi_blobs(
+        acpi_table.rsdp,
+        acpi_table.tables,
+        acpi_table.table_checksums,
+        acpi_table.table_pointers,
+    );
+
     let table_loader = FwCfgItem {
         name: FW_CFG_FILENAME_TABLE_LOADER.to_owned(),
-        content: FwCfgContent::Bytes(table_loader_bytes),
+        content: FwCfgContent::Bytes(table_loader),
     };
-    let (rsdp, tables) = acpi_table.take();
     let acpi_rsdp = FwCfgItem {
         name: FW_CFG_FILENAME_RSDP.to_owned(),
-        content: FwCfgContent::Bytes(rsdp.as_bytes().to_owned()),
+        content: FwCfgContent::Bytes(rsdp),
     };
     let apci_tables = FwCfgItem {
         name: FW_CFG_FILENAME_ACPI_TABLES.to_owned(),
@@ -649,6 +685,7 @@ impl FwCfg {
         let kernel_start = bp.text_offset;
         #[cfg(target_arch = "x86_64")]
         let kernel_start = (bp.hdr.setup_sects as usize + 1) * 512;
+
         if kernel_start <= buffer.len() {
             buffer.truncate(kernel_start);
         } else {
