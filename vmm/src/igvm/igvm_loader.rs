@@ -557,6 +557,24 @@ pub fn load_igvm(
                             new_cp.entries[i].xss_in = 0;
                         }
 
+                        // KVM SNP launch may reject a CPUID page with bits it intends
+                        // to sanitize internally. Pre-clearing the known unsafe bits keeps
+                        // the CPUID page stable across launch updates.
+                        match (new_cp.entries[i].eax_in, new_cp.entries[i].ecx_in) {
+                            (0x1, 0x0) => {
+                                new_cp.entries[i].ecx &= !(1 << 24);
+                            }
+                            (0x7, 0x0) => {
+                                new_cp.entries[i].ebx &= !0x2;
+                                new_cp.entries[i].edx = 0;
+                            }
+                            (0x80000008, 0x0) => {
+                                new_cp.entries[i].ebx &= !0x0200_0000;
+                            }
+                            (0x80000021, 0x0) => {
+                                new_cp.entries[i].ecx = 0;
+                            }
+                            _ => {}
                         }
                     }
                     new_cp.count = new_cp.entries.len() as u32;
