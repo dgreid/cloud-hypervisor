@@ -4,8 +4,12 @@
 //
 use std::collections::HashMap;
 use std::ffi::CString;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex};
 
 use hypervisor::HypervisorType;
@@ -21,9 +25,15 @@ use log::debug;
 use log::error;
 #[cfg(feature = "sev_snp")]
 use log::info;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+use linux_loader::bootparam::boot_params;
 #[cfg(feature = "mshv")]
 use mshv_bindings::*;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+use vm_memory::ByteValued;
 #[cfg(feature = "sev_snp")]
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemory};
 use zerocopy::IntoBytes;
@@ -31,6 +41,8 @@ use zerocopy::IntoBytes;
 use vm_migration::Snapshottable;
 #[cfg(feature = "sev_snp")]
 use zerocopy::{FromBytes, FromZeros};
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+use zerocopy::Immutable;
 
 #[cfg(feature = "sev_snp")]
 use crate::GuestMemoryMmap;
@@ -43,6 +55,14 @@ use crate::memory_manager::{Error as MemoryManagerError, MemoryManager};
 const ISOLATED_PAGE_SHIFT: u32 = 12;
 #[cfg(feature = "sev_snp")]
 const SNP_CPUID_LIMIT: u32 = 64;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+const SEV_HASH_BLOCK_ADDRESS: u64 = 0x10c00;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+const SEV_HASH_BLOCK_SIZE: usize = 0x400;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+const KERNEL_SETUP_INITRD_OFFSET: usize = 0x218;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+const KERNEL_SETUP_INITRD_SIZE: usize = 0x8;
 // see section 7.1
 // https://www.amd.com/content/dam/amd/en/documents/epyc-technical-docs/specifications/56860.pdf
 #[cfg(feature = "sev_snp")]
@@ -69,6 +89,47 @@ pub struct SnpCpuidInfo {
     pub _reserved2: u64,
     pub entries: [SnpCpuidFunc; SNP_CPUID_LIMIT as usize],
 }
+
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+pub struct MeasuredBootInfo {
+    pub kernel: File,
+    pub initramfs: Option<File>,
+    pub cmdline: CString,
+}
+
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, FromZeros)]
+struct SevHashTableEntry {
+    guid: [u8; 16],
+    length: u16,
+    hash: [u8; 32],
+}
+
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, FromZeros)]
+struct SevHashTable {
+    guid: [u8; 16],
+    length: u16,
+    cmdline: SevHashTableEntry,
+    initrd: SevHashTableEntry,
+    kernel: SevHashTableEntry,
+}
+
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+const PADDED_SEV_HASH_TABLE_SIZE: usize = (size_of::<SevHashTable>() + 15) & !15;
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+const PADDED_SEV_HASH_TABLE_PADDING: usize = PADDED_SEV_HASH_TABLE_SIZE - size_of::<SevHashTable>();
+
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Immutable, IntoBytes, FromZeros)]
+struct PaddedSevHashTable {
+    table: SevHashTable,
+    padding: [u8; PADDED_SEV_HASH_TABLE_PADDING],
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("command line is not a valid C string")]
@@ -93,6 +154,9 @@ pub enum Error {
     MemoryManager(MemoryManagerError),
     #[error("Error applying VMSA to vCPU registers: {0}")]
     SetVmsa(#[source] crate::cpu::Error),
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    #[error("failed to prepare measured-boot hash block")]
+    MeasuredBootIo(#[source] std::io::Error),
 }
 
 // KVM SNP page types — linux/arch/x86/include/uapi/asm/sev-guest.h
@@ -163,6 +227,101 @@ fn generate_memory_map(
     Ok(memory_map)
 }
 
+#[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+impl MeasuredBootInfo {
+    fn build_hash_block(&self) -> Result<[u8; SEV_HASH_BLOCK_SIZE], Error> {
+        let mut setup_header = vec![0u8; size_of::<boot_params>()];
+        self.kernel
+            .read_exact_at(&mut setup_header, 0)
+            .map_err(Error::MeasuredBootIo)?;
+
+        let kernel_start = {
+            let bp = boot_params::from_mut_slice(&mut setup_header).unwrap();
+            if bp.hdr.setup_sects == 0 {
+                bp.hdr.setup_sects = 4;
+            }
+            bp.hdr.type_of_loader = 0xff;
+            (u64::from(bp.hdr.setup_sects) + 1) * 512
+        };
+        let setup_len = kernel_start as usize;
+        if setup_len <= setup_header.len() {
+            setup_header.truncate(setup_len);
+        } else {
+            setup_header.resize(setup_len, 0);
+            self.kernel
+                .read_exact_at(
+                    &mut setup_header[size_of::<boot_params>()..],
+                    size_of::<boot_params>() as u64,
+                )
+                .map_err(Error::MeasuredBootIo)?;
+        }
+        setup_header[KERNEL_SETUP_INITRD_OFFSET..KERNEL_SETUP_INITRD_OFFSET + KERNEL_SETUP_INITRD_SIZE]
+            .fill(0);
+
+        let mut kernel = self.kernel.try_clone().map_err(Error::MeasuredBootIo)?;
+        kernel
+            .seek(SeekFrom::Start(kernel_start))
+            .map_err(Error::MeasuredBootIo)?;
+        let mut kernel_bytes = Vec::new();
+        kernel
+            .read_to_end(&mut kernel_bytes)
+            .map_err(Error::MeasuredBootIo)?;
+
+        let mut kernel_hasher = Sha256::new();
+        kernel_hasher.update(&setup_header);
+        kernel_hasher.update(&kernel_bytes);
+        let kernel_digest: [u8; 32] = kernel_hasher.finalize().into();
+
+        let initrd_digest: [u8; 32] = if let Some(initramfs) = &self.initramfs {
+            let mut initramfs = initramfs.try_clone().map_err(Error::MeasuredBootIo)?;
+            initramfs
+                .seek(SeekFrom::Start(0))
+                .map_err(Error::MeasuredBootIo)?;
+            let mut initramfs_hasher = Sha256::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let bytes_read = initramfs.read(&mut chunk).map_err(Error::MeasuredBootIo)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                initramfs_hasher.update(&chunk[..bytes_read]);
+            }
+            initramfs_hasher.finalize().into()
+        } else {
+            Sha256::digest([]).into()
+        };
+
+        let cmdline_digest: [u8; 32] = Sha256::digest(self.cmdline.as_bytes_with_nul()).into();
+
+        let table = PaddedSevHashTable {
+            table: SevHashTable {
+                guid: uuid::uuid!("9438d606-4f22-4cc9-b479-a793d411fd21").to_bytes_le(),
+                length: size_of::<SevHashTable>() as u16,
+                cmdline: SevHashTableEntry {
+                    guid: uuid::uuid!("97d02dd8-bd20-4c94-aa78-e7714d36ab2a").to_bytes_le(),
+                    length: size_of::<SevHashTableEntry>() as u16,
+                    hash: cmdline_digest,
+                },
+                initrd: SevHashTableEntry {
+                    guid: uuid::uuid!("44baf731-3a2f-4bd7-9af1-41e29169781d").to_bytes_le(),
+                    length: size_of::<SevHashTableEntry>() as u16,
+                    hash: initrd_digest,
+                },
+                kernel: SevHashTableEntry {
+                    guid: uuid::uuid!("4de79437-abd2-427f-b835-d5b172d2045b").to_bytes_le(),
+                    length: size_of::<SevHashTableEntry>() as u16,
+                    hash: kernel_digest,
+                },
+            },
+            padding: [0; PADDED_SEV_HASH_TABLE_PADDING],
+        };
+
+        let mut hash_block = [0u8; SEV_HASH_BLOCK_SIZE];
+        hash_block[..size_of::<PaddedSevHashTable>()].copy_from_slice(table.as_bytes());
+        Ok(hash_block)
+    }
+}
+
 // Import a parameter to the given parameter area.
 fn import_parameter(
     parameter_areas: &mut HashMap<u32, ParameterAreaState>,
@@ -207,6 +366,7 @@ pub fn load_igvm(
     memory_manager: Arc<Mutex<MemoryManager>>,
     cpu_manager: Arc<Mutex<CpuManager>>,
     cmdline: &str,
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))] measured_boot: Option<MeasuredBootInfo>,
     #[cfg(feature = "sev_snp")] host_data: &Option<String>,
 ) -> Result<Box<IgvmLoadedInfo>, Error> {
     let hypervisor_type = cpu_manager.lock().unwrap().hypervisor_type();
@@ -264,6 +424,19 @@ pub fn load_igvm(
     let mut loader = Loader::new(memory);
 
     let mut parameter_areas: HashMap<u32, ParameterAreaState> = HashMap::new();
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    let measured_boot_hash_block = measured_boot
+        .as_ref()
+        .map(MeasuredBootInfo::build_hash_block)
+        .transpose()?;
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    let measured_boot_hash_len = size_of::<PaddedSevHashTable>();
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    let measured_boot_hash_page_base = SEV_HASH_BLOCK_ADDRESS / HV_PAGE_SIZE;
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    let measured_boot_hash_offset = (SEV_HASH_BLOCK_ADDRESS % HV_PAGE_SIZE) as usize;
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    let mut measured_boot_hash_block_inserted = measured_boot_hash_block.is_none();
 
     for header in igvm_file.directives() {
         debug_assert!(header.compatibility_mask().unwrap_or(mask) & mask == mask);
@@ -383,12 +556,38 @@ pub fn load_igvm(
                             new_cp.entries[i].xcr0_in = 1;
                             new_cp.entries[i].xss_in = 0;
                         }
+
+                        }
                     }
                     new_cp.count = new_cp.entries.len() as u32;
                     info!("gpa: {:#x}", *gpa);
                     loader
                         .import_pages(gpa / HV_PAGE_SIZE, 1, acceptance, new_cp.as_mut_bytes())
                         .map_err(Error::Loader)?;
+                    imported_page = true;
+                }
+                #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+                if !imported_page
+                    && measured_boot_hash_block.is_some()
+                    && gpa / HV_PAGE_SIZE == measured_boot_hash_page_base
+                {
+                    let mut page = if data.is_empty() {
+                        vec![0; HV_PAGE_SIZE as usize]
+                    } else {
+                        let mut page = data.clone();
+                        page.resize(HV_PAGE_SIZE as usize, 0);
+                        page
+                    };
+                    page[measured_boot_hash_offset..measured_boot_hash_offset + measured_boot_hash_len]
+                        .copy_from_slice(
+                            &measured_boot_hash_block
+                                .as_ref()
+                                .unwrap()[..measured_boot_hash_len],
+                        );
+                    loader
+                        .import_pages(gpa / HV_PAGE_SIZE, 1, acceptance, &page)
+                        .map_err(Error::Loader)?;
+                    measured_boot_hash_block_inserted = true;
                     imported_page = true;
                 }
                 if !imported_page {
@@ -552,14 +751,32 @@ pub fn load_igvm(
                     .get_mut(parameter_area_index)
                     .expect("igvmfile should be valid");
                 match area {
-                    ParameterAreaState::Allocated { data, max_size } => loader
-                        .import_pages(
-                            gpa / HV_PAGE_SIZE,
-                            *max_size / HV_PAGE_SIZE,
-                            BootPageAcceptance::ExclusiveUnmeasured,
-                            data,
-                        )
-                        .map_err(Error::Loader)?,
+                    ParameterAreaState::Allocated { data, max_size } => {
+                        #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+                        if let Some(hash_block) = measured_boot_hash_block.as_ref() {
+                            let region_end = *gpa + *max_size;
+                            let hash_end = SEV_HASH_BLOCK_ADDRESS + measured_boot_hash_len as u64;
+                            if *gpa <= SEV_HASH_BLOCK_ADDRESS && hash_end <= region_end {
+                                let hash_offset = (SEV_HASH_BLOCK_ADDRESS - *gpa) as usize;
+                                let hash_limit = hash_offset + measured_boot_hash_len;
+                                if data.len() < hash_limit {
+                                    data.resize(hash_limit, 0);
+                                }
+                                data[hash_offset..hash_limit]
+                                    .copy_from_slice(&hash_block[..measured_boot_hash_len]);
+                                measured_boot_hash_block_inserted = true;
+                            }
+                        }
+
+                        loader
+                            .import_pages(
+                                gpa / HV_PAGE_SIZE,
+                                *max_size / HV_PAGE_SIZE,
+                                BootPageAcceptance::ExclusiveUnmeasured,
+                                data,
+                            )
+                            .map_err(Error::Loader)?
+                    }
                     ParameterAreaState::Inserted => panic!("igvmfile is invalid, multiple insert"),
                 }
                 *area = ParameterAreaState::Inserted;
@@ -576,6 +793,28 @@ pub fn load_igvm(
                 todo!("Header not supported!!")
             }
         }
+    }
+
+    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+    if let Some(hash_block) = measured_boot_hash_block.as_ref()
+        && !measured_boot_hash_block_inserted
+    {
+        let mut page = vec![0u8; HV_PAGE_SIZE as usize];
+        page[measured_boot_hash_offset..measured_boot_hash_offset + measured_boot_hash_len]
+            .copy_from_slice(&hash_block[..measured_boot_hash_len]);
+        loader
+            .import_pages(
+                measured_boot_hash_page_base,
+                1,
+                BootPageAcceptance::Exclusive,
+                &page,
+            )
+            .map_err(Error::Loader)?;
+        gpas.push(GpaPages {
+            gpa: measured_boot_hash_page_base * HV_PAGE_SIZE,
+            page_type: page_types.normal,
+            page_size: page_types.isolated_page_size_4kb,
+        });
     }
 
     #[cfg(feature = "sev_snp")]

@@ -1503,6 +1503,8 @@ impl Vm {
         igvm: File,
         memory_manager: Arc<Mutex<MemoryManager>>,
         cpu_manager: Arc<Mutex<cpu::CpuManager>>,
+        #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+        measured_boot: Option<igvm_loader::MeasuredBootInfo>,
         #[cfg(feature = "sev_snp")] host_data: &Option<String>,
     ) -> Result<EntryPoint> {
         // Only reserve stage0/VMSA regions for KVM + SEV-SNP; other hypervisors
@@ -1517,6 +1519,8 @@ impl Vm {
             memory_manager,
             cpu_manager.clone(),
             "",
+            #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+            measured_boot,
             #[cfg(feature = "sev_snp")]
             host_data,
         )
@@ -1610,10 +1614,58 @@ impl Vm {
         {
             if let Some(_igvm_file) = &payload.igvm {
                 let igvm = File::open(_igvm_file).map_err(Error::IgvmFile)?;
+                #[cfg(all(feature = "sev_snp", feature = "fw_cfg", target_arch = "x86_64"))]
+                let measured_boot = if _sev_snp_enabled
+                    && payload
+                        .fw_cfg_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.kernel)
+                    && payload.kernel.is_some()
+                {
+                    let kernel =
+                        File::open(payload.kernel.as_ref().unwrap()).map_err(Error::KernelFile)?;
+                    let initramfs = if payload
+                        .fw_cfg_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.initramfs)
+                    {
+                        payload
+                            .initramfs
+                            .as_ref()
+                            .map(File::open)
+                            .transpose()
+                            .map_err(Error::InitramfsFile)?
+                    } else {
+                        None
+                    };
+                    let cmdline = if payload
+                        .fw_cfg_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.cmdline)
+                    {
+                        Self::generate_cmdline(payload)?
+                            .as_cstring()
+                            .map_err(Error::CmdLineCreate)?
+                    } else {
+                        std::ffi::CString::default()
+                    };
+
+                    Some(igvm_loader::MeasuredBootInfo {
+                        kernel,
+                        initramfs,
+                        cmdline,
+                    })
+                } else {
+                    None
+                };
+                #[cfg(all(feature = "sev_snp", not(feature = "fw_cfg"), target_arch = "x86_64"))]
+                let measured_boot = None;
                 return Self::load_igvm(
                     igvm,
                     memory_manager,
                     cpu_manager,
+                    #[cfg(all(feature = "sev_snp", target_arch = "x86_64"))]
+                    measured_boot,
                     #[cfg(feature = "sev_snp")]
                     &payload.host_data,
                 );

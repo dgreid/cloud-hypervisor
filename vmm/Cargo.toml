@@ -77,6 +77,7 @@ rate_limiter = { path = "../rate_limiter" }
 seccompiler = { workspace = true }
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
+sha2 = "0.10"
 serial_buffer = { path = "../serial_buffer" }
 signal-hook = { workspace = true }
 thiserror = { workspace = true }
