@@ -704,6 +704,32 @@ impl EpollHelperHandler for BlockEpollHandler {
         }
         Ok(())
     }
+
+    fn pre_pause(&mut self, _helper: &mut EpollHelper) {
+        // When pausing for snapshot or migration, make sure to drain all async IO so the snapshot
+        // doesn't see partial writes from on-going IO.
+        // Limit spins if the kernel never delivers the completion.
+        let mut spin = 0;
+        const MAX_DRAIN_ITERATIONS: usize = 256;
+        while !self.inflight_requests.is_empty() {
+            let _ = self.disk_image.notifier().read();
+            if let Err(e) = self.process_queue_complete() {
+                warn!("pre_pause: process_queue_complete failed: {e:?}");
+                break;
+            }
+            spin += 1;
+            if spin > MAX_DRAIN_ITERATIONS {
+                warn!(
+                    "pre_pause: timed out draining inflight requests; \
+                     snapshot may race kernel DMA"
+                );
+                break;
+            }
+            if !self.inflight_requests.is_empty() {
+                std::thread::yield_now();
+            }
+        }
+    }
 }
 
 /// Virtio device for exposing block level read/write operations on a host file.

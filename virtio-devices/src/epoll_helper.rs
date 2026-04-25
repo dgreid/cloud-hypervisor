@@ -79,6 +79,12 @@ pub trait EpollHelperHandler {
     ) -> Result<(), EpollHelperError> {
         Ok(())
     }
+
+    // Called by the epoll loop on the worker thread before a pause Backends
+    // that have asynchronous I/O outstanding use this to ensure no IO is
+    // outstanding while paused. this is important for migration and snapshot to
+    // have stable memory to copy.
+    fn pre_pause(&mut self, _helper: &mut EpollHelper) {}
 }
 
 impl EpollHelper {
@@ -221,6 +227,10 @@ impl EpollHelper {
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
 
+                        // Let the handler drain any in-flight asynchronous
+                        // I/O before we acknowledge the pause.
+                        handler.pre_pause(self);
+
                         // Acknowledge the pause is effective by using the
                         // paused_sync barrier.
                         paused_sync.wait();
@@ -292,6 +302,10 @@ impl EpollHelper {
                     }
                     EPOLL_HELPER_EVENT_PAUSE => {
                         info!("PAUSE_EVENT received, pausing epoll loop");
+
+                        // Let the handler drain any in-flight asynchronous
+                        // I/O before we acknowledge the pause.
+                        handler.pre_pause(self);
 
                         // Acknowledge the pause is effective by using the
                         // paused_sync barrier.
