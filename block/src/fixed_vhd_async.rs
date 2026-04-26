@@ -32,7 +32,7 @@ impl AsyncIo for FixedVhdAsync {
         self.raw_file_async.notifier()
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -48,10 +48,11 @@ impl AsyncIo for FixedVhdAsync {
             )));
         }
 
-        self.raw_file_async.read_vectored(offset, iovecs, user_data)
+        // SAFETY: forwarding the caller-upheld iovec contract from `AsyncIo`.
+        unsafe { self.raw_file_async.read_vectored(offset, iovecs, user_data) }
     }
 
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -67,8 +68,11 @@ impl AsyncIo for FixedVhdAsync {
             )));
         }
 
-        self.raw_file_async
-            .write_vectored(offset, iovecs, user_data)
+        // SAFETY: forwarding the caller-upheld iovec contract from `AsyncIo`.
+        unsafe {
+            self.raw_file_async
+                .write_vectored(offset, iovecs, user_data)
+        }
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
@@ -95,7 +99,11 @@ impl AsyncIo for FixedVhdAsync {
         true
     }
 
-    fn submit_batch_requests(&mut self, batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
-        self.raw_file_async.submit_batch_requests(batch_request)
+    unsafe fn submit_batch_requests(
+        &mut self,
+        batch_request: &[BatchRequest],
+    ) -> AsyncIoResult<()> {
+        // SAFETY: forwarding the caller-upheld iovec contract from `AsyncIo`.
+        unsafe { self.raw_file_async.submit_batch_requests(batch_request) }
     }
 }

@@ -192,7 +192,7 @@ impl AsyncIo for QcowSync {
         &self.eventfd
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -288,7 +288,7 @@ impl AsyncIo for QcowSync {
         Ok(())
     }
 
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -482,9 +482,13 @@ mod unit_tests {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        async_io
-            .read_vectored(offset as libc::off_t, &[iovec], 1)
-            .unwrap();
+        // SAFETY: `buf` outlives the synchronous read, and the iovec is the
+        // sole reference into it for the duration of the call.
+        unsafe {
+            async_io
+                .read_vectored(offset as libc::off_t, &[iovec], 1)
+                .unwrap();
+        }
         let (user_data, result) = async_io.next_completed_request().unwrap();
         assert_eq!(user_data, 1);
         assert_eq!(result as usize, len, "read should return requested length");
@@ -497,9 +501,13 @@ mod unit_tests {
             iov_base: data.as_ptr() as *mut libc::c_void,
             iov_len: data.len(),
         };
-        async_io
-            .write_vectored(offset as libc::off_t, &[iovec], 1)
-            .unwrap();
+        // SAFETY: `data` outlives the synchronous write and is not mutated
+        // during the call.
+        unsafe {
+            async_io
+                .write_vectored(offset as libc::off_t, &[iovec], 1)
+                .unwrap();
+        }
         let (user_data, result) = async_io.next_completed_request().unwrap();
         assert_eq!(user_data, 1);
         assert_eq!(result as usize, data.len());
@@ -1685,7 +1693,8 @@ mod unit_tests {
         let total = a.len() + b.len() + c.len();
 
         let mut aio = disk.create_async_io(1).unwrap();
-        aio.write_vectored(0, &iovecs_w, 1).unwrap();
+        // SAFETY: write source buffers outlive the synchronous write.
+        unsafe { aio.write_vectored(0, &iovecs_w, 1).unwrap() };
         let (ud, res) = aio.next_completed_request().unwrap();
         assert_eq!(ud, 1);
         assert_eq!(res as usize, total);
@@ -1712,7 +1721,9 @@ mod unit_tests {
         ];
 
         let mut aio = disk.create_async_io(1).unwrap();
-        aio.read_vectored(0, &iovecs_r, 10).unwrap();
+        // SAFETY: read destination buffers outlive the synchronous read and
+        // are uniquely owned via the &mut references they were built from.
+        unsafe { aio.read_vectored(0, &iovecs_r, 10).unwrap() };
         let (ud, res) = aio.next_completed_request().unwrap();
         assert_eq!(ud, 10);
         assert_eq!(res as usize, total);

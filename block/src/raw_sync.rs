@@ -38,13 +38,14 @@ impl AsyncIo for RawFileSync {
         self.alignment
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
-        // SAFETY: FFI call with valid arguments
+        // SAFETY: FFI call; the file descriptor is valid and the caller
+        // upholds the iovec buffer contract from `AsyncIo`.
         let result = unsafe {
             libc::preadv(
                 self.fd as libc::c_int,
@@ -63,13 +64,14 @@ impl AsyncIo for RawFileSync {
         Ok(())
     }
 
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
-        // SAFETY: FFI call with valid arguments
+        // SAFETY: FFI call; the file descriptor is valid and the caller
+        // upholds the iovec buffer contract from `AsyncIo`.
         let result = unsafe {
             libc::pwritev(
                 self.fd as libc::c_int,

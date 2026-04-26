@@ -124,34 +124,40 @@ impl AsyncIo for VhdxSync {
         &self.eventfd
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
-        self.vhdx_file.lock().unwrap().read_vectored_sync(
-            offset,
-            iovecs,
-            user_data,
-            &self.eventfd,
-            &mut self.completion_list,
-        )
+        // SAFETY: forwarding the caller-upheld iovec contract from `AsyncIo`.
+        unsafe {
+            self.vhdx_file.lock().unwrap().read_vectored_sync(
+                offset,
+                iovecs,
+                user_data,
+                &self.eventfd,
+                &mut self.completion_list,
+            )
+        }
     }
 
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
-        self.vhdx_file.lock().unwrap().write_vectored_sync(
-            offset,
-            iovecs,
-            user_data,
-            &self.eventfd,
-            &mut self.completion_list,
-        )
+        // SAFETY: forwarding the caller-upheld iovec contract from `AsyncIo`.
+        unsafe {
+            self.vhdx_file.lock().unwrap().write_vectored_sync(
+                offset,
+                iovecs,
+                user_data,
+                &self.eventfd,
+                &mut self.completion_list,
+            )
+        }
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {

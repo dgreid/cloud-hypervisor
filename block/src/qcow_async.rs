@@ -240,7 +240,7 @@ impl AsyncIo for QcowAsync {
         &self.eventfd
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -290,7 +290,7 @@ impl AsyncIo for QcowAsync {
     // state machine for COW (backing read, cluster allocation, data
     // write, L2 commit) with per request buffer lifetime tracking
     // and write ordering.
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -383,7 +383,10 @@ impl AsyncIo for QcowAsync {
         self.io_alignment
     }
 
-    fn submit_batch_requests(&mut self, batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
+    unsafe fn submit_batch_requests(
+        &mut self,
+        batch_request: &[BatchRequest],
+    ) -> AsyncIoResult<()> {
         let (submitter, mut sq, _) = self.io_uring.split();
         let mut needs_submit = false;
         let mut sync_completions: Vec<(u64, i32)> = Vec::new();
@@ -736,9 +739,12 @@ mod unit_tests {
             iov_base: data.as_ptr() as *mut libc::c_void,
             iov_len: data.len(),
         };
-        async_io
-            .write_vectored(offset as libc::off_t, &[iovec], 2)
-            .unwrap();
+        // SAFETY: `data` outlives the call and we wait for completion below.
+        unsafe {
+            async_io
+                .write_vectored(offset as libc::off_t, &[iovec], 2)
+                .unwrap();
+        }
         let (user_data, result) = wait_for_completion(async_io.as_mut());
         assert_eq!(user_data, 2);
         assert_eq!(
@@ -755,9 +761,13 @@ mod unit_tests {
             iov_base: buf.as_mut_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        async_io
-            .read_vectored(offset as libc::off_t, &[iovec], 1)
-            .unwrap();
+        // SAFETY: `buf` outlives the call, the iovec is the sole reference
+        // into it, and we wait for completion before returning it.
+        unsafe {
+            async_io
+                .read_vectored(offset as libc::off_t, &[iovec], 1)
+                .unwrap();
+        }
         let (user_data, result) = wait_for_completion(async_io.as_mut());
         assert_eq!(user_data, 1);
         assert_eq!(result as usize, len, "read should return requested length");
@@ -894,7 +904,9 @@ mod unit_tests {
             },
         ];
 
-        async_io.submit_batch_requests(&batch).unwrap();
+        // SAFETY: write buffers outlive the batch and we drain completions
+        // before they drop.
+        unsafe { async_io.submit_batch_requests(&batch).unwrap() };
 
         let mut completions = [
             wait_for_completion(async_io.as_mut()),
@@ -933,7 +945,9 @@ mod unit_tests {
             },
         ];
 
-        async_io.submit_batch_requests(&read_batch).unwrap();
+        // SAFETY: read buffers outlive the batch and we drain completions
+        // before they drop.
+        unsafe { async_io.submit_batch_requests(&read_batch).unwrap() };
 
         let mut completions = [
             wait_for_completion(async_io.as_mut()),
@@ -1155,7 +1169,9 @@ mod unit_tests {
                         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
                         iov_len: buf.len(),
                     };
-                    async_io.read_vectored(0, &[iovec], 1).unwrap();
+                    // SAFETY: `buf` outlives this call and the iovec is its
+                    // sole reference; the read completes before we read buf.
+                    unsafe { async_io.read_vectored(0, &[iovec], 1).unwrap() };
                     let (_, result) = wait_for_completion(async_io.as_mut());
                     assert_eq!(result as usize, cluster_size);
                     assert_eq!(buf, expected);

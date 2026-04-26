@@ -40,8 +40,11 @@ pub fn micro_bench_aio_drain(control: &PerformanceTestControl) -> f64 {
             iov_base: buf.as_ptr() as *mut _,
             iov_len: buf.len(),
         };
-        aio.write_vectored((i as u64 * BLOCK_SIZE) as libc::off_t, &[iovec], i as u64)
-            .expect("write_vectored failed");
+        // SAFETY: `buf` outlives `aio`; all completions are drained below.
+        unsafe {
+            aio.write_vectored((i as u64 * BLOCK_SIZE) as libc::off_t, &[iovec], i as u64)
+                .expect("write_vectored failed");
+        }
     }
 
     // Wait until the eventfd signals that completions are available.
@@ -74,7 +77,8 @@ pub fn micro_bench_qcow_read(control: &PerformanceTestControl) -> f64 {
     let iovec = read_iovec(&mut buf);
 
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     // Drain completions so Drop is clean.
@@ -102,13 +106,16 @@ pub fn micro_bench_qcow_random_read(control: &PerformanceTestControl) -> f64 {
 
     let start = Instant::now();
     for (seq, &cluster_idx) in indices.iter().enumerate() {
-        async_io
-            .read_vectored(
-                (cluster_idx as u64 * QCOW_CLUSTER_SIZE) as libc::off_t,
-                &[iovec],
-                seq as u64,
-            )
-            .expect("read_vectored failed");
+        // SAFETY: `buf` outlives `async_io`; completions are drained below.
+        unsafe {
+            async_io
+                .read_vectored(
+                    (cluster_idx as u64 * QCOW_CLUSTER_SIZE) as libc::off_t,
+                    &[iovec],
+                    seq as u64,
+                )
+                .expect("read_vectored failed");
+        }
     }
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -134,7 +141,8 @@ pub fn micro_bench_qcow_write(control: &PerformanceTestControl) -> f64 {
     let iovec = write_iovec(&buf);
 
     let start = Instant::now();
-    submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     // Drain completions so Drop is clean.
@@ -185,7 +193,8 @@ pub fn micro_bench_qcow_fsync(control: &PerformanceTestControl) -> f64 {
     // Write num_ops clusters to dirty L2 and refcount metadata.
     let buf = vec![0xA5u8; QCOW_CLUSTER_SIZE as usize];
     let iovec = write_iovec(&buf);
-    submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
     // Drain write completions.
     drain_completions(async_io.as_mut(), num_ops);
 
@@ -216,7 +225,8 @@ pub fn micro_bench_qcow_backing_read(control: &PerformanceTestControl) -> f64 {
     let iovec = read_iovec(&mut buf);
 
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     drain_completions(async_io.as_mut(), num_ops);
@@ -242,7 +252,8 @@ pub fn micro_bench_qcow_cow_write(control: &PerformanceTestControl) -> f64 {
     let iovec = write_iovec(&buf);
 
     let start = Instant::now();
-    submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     drain_completions(async_io.as_mut(), num_ops);
@@ -266,7 +277,8 @@ pub fn micro_bench_qcow_compressed_read(control: &PerformanceTestControl) -> f64
     let iovec = read_iovec(&mut buf);
 
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     drain_completions(async_io.as_mut(), num_ops);
@@ -296,7 +308,8 @@ pub fn micro_bench_qcow_multi_cluster_read(control: &PerformanceTestControl) -> 
 
     let num_reads = num_ops / CLUSTERS_PER_READ;
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_reads, read_size as u64, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_reads, read_size as u64, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     drain_completions(async_io.as_mut(), num_reads);
@@ -323,7 +336,8 @@ pub fn micro_bench_qcow_l2_cache_miss(control: &PerformanceTestControl) -> f64 {
 
     let stride = L2_ENTRIES_PER_TABLE as u64 * QCOW_CLUSTER_SIZE;
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, stride, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, stride, &[iovec]) };
     let elapsed = start.elapsed().as_secs_f64();
 
     drain_completions(async_io.as_mut(), num_ops);
@@ -350,7 +364,8 @@ pub fn micro_bench_qcow_async_read(control: &PerformanceTestControl) -> f64 {
     let iovec = read_iovec(&mut buf);
 
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
 
     // Drain all io_uring completions before stopping the clock.
     drain_async_completions(async_io.as_mut(), num_ops);
@@ -389,9 +404,13 @@ pub fn micro_bench_qcow_batch_read(control: &PerformanceTestControl) -> f64 {
         .collect();
 
     let start = Instant::now();
-    async_io
-        .submit_batch_requests(&batch)
-        .expect("submit_batch_requests failed");
+    // SAFETY: `buf` (sliced into the batch) outlives `async_io`; all
+    // completions are drained below.
+    unsafe {
+        async_io
+            .submit_batch_requests(&batch)
+            .expect("submit_batch_requests failed");
+    }
 
     // Drain all io_uring completions before stopping the clock.
     drain_async_completions(async_io.as_mut(), num_ops);
@@ -416,13 +435,16 @@ pub fn micro_bench_qcow_async_random_read(control: &PerformanceTestControl) -> f
 
     let start = Instant::now();
     for (seq, &cluster_idx) in indices.iter().enumerate() {
-        async_io
-            .read_vectored(
-                (cluster_idx as u64 * QCOW_CLUSTER_SIZE) as libc::off_t,
-                &[iovec],
-                seq as u64,
-            )
-            .expect("read_vectored failed");
+        // SAFETY: `buf` outlives `async_io`; completions are drained below.
+        unsafe {
+            async_io
+                .read_vectored(
+                    (cluster_idx as u64 * QCOW_CLUSTER_SIZE) as libc::off_t,
+                    &[iovec],
+                    seq as u64,
+                )
+                .expect("read_vectored failed");
+        }
     }
 
     drain_async_completions(async_io.as_mut(), num_ops);
@@ -451,7 +473,8 @@ pub fn micro_bench_qcow_async_multi_cluster_read(control: &PerformanceTestContro
 
     let num_reads = num_ops / CLUSTERS_PER_READ;
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_reads, read_size as u64, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_reads, read_size as u64, &[iovec]) };
 
     drain_async_completions(async_io.as_mut(), num_reads);
     start.elapsed().as_secs_f64()
@@ -475,7 +498,8 @@ pub fn micro_bench_qcow_async_backing_read(control: &PerformanceTestControl) -> 
     let iovec = read_iovec(&mut buf);
 
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
 
     drain_async_completions(async_io.as_mut(), num_ops);
     start.elapsed().as_secs_f64()
@@ -497,7 +521,8 @@ pub fn micro_bench_qcow_async_compressed_read(control: &PerformanceTestControl) 
     let iovec = read_iovec(&mut buf);
 
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
 
     drain_async_completions(async_io.as_mut(), num_ops);
     start.elapsed().as_secs_f64()
@@ -522,7 +547,8 @@ pub fn micro_bench_qcow_async_write(control: &PerformanceTestControl) -> f64 {
     let iovec = write_iovec(&buf);
 
     let start = Instant::now();
-    submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_writes(async_io.as_mut(), num_ops, QCOW_CLUSTER_SIZE, &[iovec]) };
 
     drain_async_completions(async_io.as_mut(), num_ops);
     start.elapsed().as_secs_f64()
@@ -544,7 +570,8 @@ pub fn micro_bench_qcow_async_l2_cache_miss(control: &PerformanceTestControl) ->
 
     let stride = L2_ENTRIES_PER_TABLE as u64 * QCOW_CLUSTER_SIZE;
     let start = Instant::now();
-    submit_reads(async_io.as_mut(), num_ops, stride, &[iovec]);
+    // SAFETY: `buf` outlives `async_io`; completions are drained below.
+    unsafe { submit_reads(async_io.as_mut(), num_ops, stride, &[iovec]) };
 
     drain_async_completions(async_io.as_mut(), num_ops);
     start.elapsed().as_secs_f64()
@@ -584,9 +611,13 @@ pub fn micro_bench_qcow_batch_write(control: &PerformanceTestControl) -> f64 {
         .collect();
 
     let start = Instant::now();
-    async_io
-        .submit_batch_requests(&batch)
-        .expect("submit_batch_requests failed");
+    // SAFETY: `buf` (sliced into the batch) outlives `async_io`; all
+    // completions are drained below.
+    unsafe {
+        async_io
+            .submit_batch_requests(&batch)
+            .expect("submit_batch_requests failed");
+    }
 
     drain_async_completions(async_io.as_mut(), num_ops);
     start.elapsed().as_secs_f64()

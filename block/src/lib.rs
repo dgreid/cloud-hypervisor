@@ -453,7 +453,16 @@ pub fn preallocate_disk<P: AsRef<Path>>(file: &File, path: P) {
 }
 
 pub trait AsyncAdaptor {
-    fn read_vectored_sync(
+    /// Synchronously execute a vectored read, treating each iovec as a
+    /// destination buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure every `iovec` in `iovecs` describes a
+    /// valid, writable region of `iov_len` bytes that is not aliased by
+    /// any other reference for the duration of this call (the iovecs are
+    /// transmuted into `&mut [u8]` slices internally).
+    unsafe fn read_vectored_sync(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -468,7 +477,8 @@ pub trait AsyncAdaptor {
         let mut slices: SmallVec<[IoSliceMut; DEFAULT_DESCRIPTOR_VEC_SIZE]> =
             SmallVec::with_capacity(iovecs.len());
         for iovec in iovecs.iter() {
-            // SAFETY: on Linux IoSliceMut wraps around libc::iovec
+            // SAFETY: on Linux IoSliceMut wraps around libc::iovec; the
+            // caller upholds buffer validity and exclusive access.
             slices.push(IoSliceMut::new(unsafe {
                 std::mem::transmute::<libc::iovec, &mut [u8]>(*iovec)
             }));
@@ -492,7 +502,15 @@ pub trait AsyncAdaptor {
         Ok(())
     }
 
-    fn write_vectored_sync(
+    /// Synchronously execute a vectored write, treating each iovec as a
+    /// source buffer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure every `iovec` in `iovecs` describes a
+    /// valid, readable region of `iov_len` bytes that is not concurrently
+    /// mutated through another reference for the duration of this call.
+    unsafe fn write_vectored_sync(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -507,7 +525,8 @@ pub trait AsyncAdaptor {
         let mut slices: SmallVec<[IoSlice; DEFAULT_DESCRIPTOR_VEC_SIZE]> =
             SmallVec::with_capacity(iovecs.len());
         for iovec in iovecs.iter() {
-            // SAFETY: on Linux IoSlice wraps around libc::iovec
+            // SAFETY: on Linux IoSlice wraps around libc::iovec; the
+            // caller upholds buffer validity.
             slices.push(IoSlice::new(unsafe {
                 std::mem::transmute::<libc::iovec, &mut [u8]>(*iovec)
             }));

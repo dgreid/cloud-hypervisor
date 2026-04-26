@@ -367,7 +367,11 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
             }
         }
 
-        match self.disk_image.submit_batch_requests(&batch_requests) {
+        // SAFETY: each batch request's iovecs reference guest memory mapped
+        // through vm-memory (or aligned bounce buffers tracked by the
+        // request); both remain live and not otherwise borrowed until the
+        // matching completions are reaped during async I/O completion.
+        match unsafe { self.disk_image.submit_batch_requests(&batch_requests) } {
             Ok(()) => {
                 self.inflight_requests.extend(batch_inflight_requests);
             }

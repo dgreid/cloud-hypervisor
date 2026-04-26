@@ -84,13 +84,42 @@ pub type AsyncIoResult<T> = std::result::Result<T, AsyncIoError>;
 
 pub trait AsyncIo: Send {
     fn notifier(&self) -> &EventFd;
-    fn read_vectored(
+    /// Submit a vectored read.
+    ///
+    /// # Safety
+    ///
+    /// Each `iovec` in `iovecs` describes a raw `(iov_base, iov_len)` pair
+    /// that the implementation may dereference, possibly asynchronously
+    /// (e.g. handed to the kernel via io_uring or Linux AIO). The caller
+    /// must ensure that:
+    ///
+    /// - every `iov_base` points to a valid, writable region of at least
+    ///   `iov_len` bytes;
+    /// - those buffers, and the `iovecs` slice itself, remain live and not
+    ///   otherwise borrowed or mutated until the matching completion has
+    ///   been observed via [`AsyncIo::next_completed_request`];
+    /// - no other reference may alias the destination buffers while the
+    ///   operation is in flight.
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()>;
-    fn write_vectored(
+    /// Submit a vectored write.
+    ///
+    /// # Safety
+    ///
+    /// Each `iovec` in `iovecs` describes a raw `(iov_base, iov_len)` pair
+    /// that the implementation may dereference, possibly asynchronously.
+    /// The caller must ensure that:
+    ///
+    /// - every `iov_base` points to a valid, readable region of at least
+    ///   `iov_len` bytes;
+    /// - those buffers, and the `iovecs` slice itself, remain live and
+    ///   unmodified until the matching completion has been observed via
+    ///   [`AsyncIo::next_completed_request`].
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -103,7 +132,19 @@ pub trait AsyncIo: Send {
     fn batch_requests_enabled(&self) -> bool {
         false
     }
-    fn submit_batch_requests(&mut self, _batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
+    /// Submit a batch of vectored I/O requests.
+    ///
+    /// # Safety
+    ///
+    /// Each `BatchRequest` carries iovecs with the same buffer-validity and
+    /// liveness obligations as [`AsyncIo::read_vectored`] and
+    /// [`AsyncIo::write_vectored`]. The caller must uphold those invariants
+    /// for every request in `batch_request` until each matching completion
+    /// has been observed via [`AsyncIo::next_completed_request`].
+    unsafe fn submit_batch_requests(
+        &mut self,
+        _batch_request: &[BatchRequest],
+    ) -> AsyncIoResult<()> {
         Ok(())
     }
     fn alignment(&self) -> u64 {

@@ -52,7 +52,7 @@ impl AsyncIo for RawFileAsync {
         self.alignment
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -60,8 +60,8 @@ impl AsyncIo for RawFileAsync {
     ) -> AsyncIoResult<()> {
         let (submitter, mut sq, _) = self.io_uring.split();
 
-        // SAFETY: we know the file descriptor is valid and we
-        // relied on vm-memory to provide the buffer address.
+        // SAFETY: the file descriptor is valid; the caller upholds the
+        // iovec buffer lifetime and provenance contract from `AsyncIo`.
         unsafe {
             sq.push(
                 &opcode::Readv::new(types::Fd(self.fd), iovecs.as_ptr(), iovecs.len() as u32)
@@ -80,7 +80,7 @@ impl AsyncIo for RawFileAsync {
         Ok(())
     }
 
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -88,8 +88,8 @@ impl AsyncIo for RawFileAsync {
     ) -> AsyncIoResult<()> {
         let (submitter, mut sq, _) = self.io_uring.split();
 
-        // SAFETY: we know the file descriptor is valid and we
-        // relied on vm-memory to provide the buffer address.
+        // SAFETY: the file descriptor is valid; the caller upholds the
+        // iovec buffer lifetime and provenance contract from `AsyncIo`.
         unsafe {
             sq.push(
                 &opcode::Writev::new(types::Fd(self.fd), iovecs.as_ptr(), iovecs.len() as u32)
@@ -145,7 +145,10 @@ impl AsyncIo for RawFileAsync {
         true
     }
 
-    fn submit_batch_requests(&mut self, batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
+    unsafe fn submit_batch_requests(
+        &mut self,
+        batch_request: &[BatchRequest],
+    ) -> AsyncIoResult<()> {
         if !self.batch_requests_enabled() {
             return Ok(());
         }
@@ -156,8 +159,9 @@ impl AsyncIo for RawFileAsync {
         for req in batch_request {
             match req.request_type {
                 RequestType::In => {
-                    // SAFETY: we know the file descriptor is valid and we
-                    // relied on vm-memory to provide the buffer address.
+                    // SAFETY: the file descriptor is valid; the caller
+                    // upholds the iovec buffer lifetime and provenance
+                    // contract from `AsyncIo`.
                     unsafe {
                         sq.push(
                             &opcode::Readv::new(
@@ -176,8 +180,9 @@ impl AsyncIo for RawFileAsync {
                     submitted = true;
                 }
                 RequestType::Out => {
-                    // SAFETY: we know the file descriptor is valid and we
-                    // relied on vm-memory to provide the buffer address.
+                    // SAFETY: the file descriptor is valid; the caller
+                    // upholds the iovec buffer lifetime and provenance
+                    // contract from `AsyncIo`.
                     unsafe {
                         sq.push(
                             &opcode::Writev::new(

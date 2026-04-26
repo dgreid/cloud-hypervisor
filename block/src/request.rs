@@ -358,9 +358,16 @@ impl Request {
                         request_type,
                     });
                 } else {
-                    disk_image
-                        .read_vectored(offset, &iovecs, user_data)
-                        .map_err(ExecuteError::AsyncRead)?;
+                    // SAFETY: iovecs reference guest memory mapped through
+                    // vm-memory (or aligned bounce buffers tracked by
+                    // `aligned_operations`); both remain live and non-aliased
+                    // until the matching completion is reaped in
+                    // `complete_async`.
+                    unsafe {
+                        disk_image
+                            .read_vectored(offset, &iovecs, user_data)
+                            .map_err(ExecuteError::AsyncRead)?;
+                    }
                 }
             }
             RequestType::Out => {
@@ -372,9 +379,16 @@ impl Request {
                         request_type,
                     });
                 } else {
-                    disk_image
-                        .write_vectored(offset, &iovecs, user_data)
-                        .map_err(ExecuteError::AsyncWrite)?;
+                    // SAFETY: iovecs reference guest memory mapped through
+                    // vm-memory (or aligned bounce buffers tracked by
+                    // `aligned_operations`); both remain live and unmodified
+                    // until the matching completion is reaped in
+                    // `complete_async`.
+                    unsafe {
+                        disk_image
+                            .write_vectored(offset, &iovecs, user_data)
+                            .map_err(ExecuteError::AsyncWrite)?;
+                    }
                 }
             }
             RequestType::Flush => {

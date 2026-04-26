@@ -50,7 +50,7 @@ impl AsyncIo for RawFileAsyncAio {
         self.alignment
     }
 
-    fn read_vectored(
+    unsafe fn read_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
@@ -75,7 +75,7 @@ impl AsyncIo for RawFileAsyncAio {
         Ok(())
     }
 
-    fn write_vectored(
+    unsafe fn write_vectored(
         &mut self,
         offset: libc::off_t,
         iovecs: &[libc::iovec],
