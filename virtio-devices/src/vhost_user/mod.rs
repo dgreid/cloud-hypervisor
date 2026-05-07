@@ -193,6 +193,8 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     pub server: bool,
     pub backend_req_handler: Option<FrontendReqHandler<S>>,
     pub inflight: Option<Inflight>,
+    /// Flag set by the worker when the vhost-user backend is no longer reachable.
+    pub disconnected: Arc<AtomicBool>,
 }
 
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
@@ -218,6 +220,18 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
     }
 
     fn reconnect(&mut self, helper: &mut EpollHelper) -> std::result::Result<(), EpollHelperError> {
+        let result = self.reconnect_inner(helper);
+        if result.is_err() {
+            // If reconnect fails, mark disconnected to avoid repeated failed socket calls.
+            self.disconnected.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn reconnect_inner(
+        &mut self,
+        helper: &mut EpollHelper,
+    ) -> std::result::Result<(), EpollHelperError> {
         helper.del_event_custom(
             self.vu.lock().unwrap().socket_handle().as_raw_fd(),
             HUP_CONNECTION_EVENT,
@@ -280,32 +294,37 @@ impl<S: VhostUserFrontendReqHandler> EpollHelperHandler for VhostUserEpollHandle
         event: &epoll::Event,
     ) -> std::result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
-        match ev_type {
-            HUP_CONNECTION_EVENT => {
-                self.reconnect(helper).map_err(|e| {
-                    EpollHelperError::HandleEvent(anyhow!(
-                        "failed to reconnect vhost-user backend for socket {}: {e:?}",
-                        self.socket_path
-                    ))
-                })?;
-            }
+        let result = match ev_type {
+            HUP_CONNECTION_EVENT => self.reconnect(helper).map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!(
+                    "failed to reconnect vhost-user backend for socket {}: {e:?}",
+                    self.socket_path
+                ))
+            }),
             BACKEND_REQ_EVENT => {
                 if let Some(backend_req_handler) = self.backend_req_handler.as_mut() {
-                    backend_req_handler.handle_request().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to handle request from vhost-user backend: {e:?}"
-                        ))
-                    })?;
+                    backend_req_handler
+                        .handle_request()
+                        .map(|_| ())
+                        .map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Failed to handle request from vhost-user backend: {e:?}"
+                            ))
+                        })
+                } else {
+                    Ok(())
                 }
             }
-            _ => {
-                return Err(EpollHelperError::HandleEvent(anyhow!(
-                    "Unknown event for vhost-user thread"
-                )));
-            }
-        }
+            _ => Err(EpollHelperError::HandleEvent(anyhow!(
+                "Unknown event for vhost-user thread"
+            ))),
+        };
 
-        Ok(())
+        // If the backend hits and error it is unusable from this point on.
+        if result.is_err() {
+            self.disconnected.store(true, Ordering::Relaxed);
+        }
+        result
     }
 }
 
@@ -349,6 +368,8 @@ pub struct VhostUserCommon {
     pub server: bool,
     pub vring_bases: Option<Vec<u64>>,
     pub epoll_thread: Option<thread::JoinHandle<()>>,
+    /// Indicates that the backend is no longer reachable. Shared with EPollHandler.
+    pub disconnected: Arc<AtomicBool>,
 }
 
 impl VhostUserCommon {
@@ -407,6 +428,7 @@ impl VhostUserCommon {
             server: self.server,
             backend_req_handler,
             inflight,
+            disconnected: self.disconnected.clone(),
         })
     }
 
