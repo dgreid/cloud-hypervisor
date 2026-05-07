@@ -854,3 +854,148 @@ impl VhostUserCommon {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::GuestAddress;
+    use vmm_sys_util::eventfd::EFD_NONBLOCK;
+
+    use super::*;
+
+    fn disconnected_common() -> VhostUserCommon {
+        let common = VhostUserCommon {
+            socket_path: "/test/vhost-user-disconnected.sock".to_string(),
+            vu_num_queues: 2,
+            ..Default::default()
+        };
+        common.disconnected.store(true, Ordering::Relaxed);
+        common
+    }
+
+    fn dummy_region() -> Arc<GuestRegionMmap> {
+        Arc::new(
+            GuestRegionMmap::new(
+                vm_memory::mmap::MmapRegion::new(0x1000).expect("mmap region"),
+                GuestAddress(0),
+            )
+            .expect("guest region"),
+        )
+    }
+
+    #[test]
+    fn default_disconnected_is_false() {
+        let common = VhostUserCommon::default();
+        assert!(!common.disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn transport_loss_classification_is_conservative() {
+        let socket_broken = Error::VhostUserSetVringEnable(VhostError::VhostUserProtocol(
+            VhostUserError::SocketBroken(std::io::Error::from_raw_os_error(libc::EPIPE)),
+        ));
+        assert!(socket_broken.is_transport_lost());
+
+        let disconnected = Error::VhostUserSetVringEnable(VhostError::VhostUserProtocol(
+            VhostUserError::Disconnected,
+        ));
+        assert!(disconnected.is_transport_lost());
+
+        let backend_nack = Error::VhostUserSetVringEnable(VhostError::VhostUserProtocol(
+            VhostUserError::BackendInternalError,
+        ));
+        assert!(!backend_nack.is_transport_lost());
+
+        let retry = Error::VhostUserSetVringEnable(VhostError::VhostUserProtocol(
+            VhostUserError::SocketRetry(std::io::Error::from_raw_os_error(libc::EAGAIN)),
+        ));
+        assert!(!retry.is_transport_lost());
+
+        assert!(!Error::MissingRegionFd.is_transport_lost());
+    }
+
+    #[test]
+    fn pause_when_disconnected_reports_skipped() {
+        let mut common = disconnected_common();
+        // pause() must surface the skip via DeviceDisconnected so the
+        // DeviceManager iterator can log-and-continue rather than aborting.
+        match common.pause() {
+            Err(MigratableError::DeviceDisconnected(id)) => {
+                assert_eq!(id, common.socket_path);
+            }
+            other => panic!("expected DeviceDisconnected, got {other:?}"),
+        }
+        assert!(common.disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn resume_when_disconnected_reports_skipped() {
+        let mut common = disconnected_common();
+        // resume() returns DeviceDisconnected instead of the underlying
+        // protocol error — that's the path that previously took the VMM
+        // down with MigratableError::Resume during shutdown.
+        match common.resume() {
+            Err(MigratableError::DeviceDisconnected(id)) => {
+                assert_eq!(id, common.socket_path);
+            }
+            other => panic!("expected DeviceDisconnected, got {other:?}"),
+        }
+        assert!(common.disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn add_memory_region_when_disconnected_fails() {
+        let mut common = disconnected_common();
+        let region = dummy_region();
+        let result = common.add_memory_region(&None, &region);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::VhostUserUpdateMemory(
+                Error::BackendDisconnected(_)
+            ))
+        ));
+        assert!(common.disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn reset_when_disconnected_skips_backend() {
+        let mut common = disconnected_common();
+        // Install a kill_evt so reset's bookkeeping has something to do.
+        common.virtio_common.kill_evt = Some(EventFd::new(EFD_NONBLOCK).expect("kill_evt"));
+        // Should not panic, should not block, should not touch the (absent)
+        // backend handle.
+        common.reset("test-id");
+        assert!(common.disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shutdown_when_disconnected_short_circuits() {
+        let mut common = disconnected_common();
+        // No epoll_thread joined, no socket touched. Must return promptly.
+        common.shutdown();
+        assert!(common.vu.is_none());
+        assert!(common.disconnected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn activate_when_disconnected_fails_fast() {
+        // A guest that resets the device after seeing DEVICE_NEEDS_RESET and
+        // re-initializes it must not drive setup_vhost_user against the dead
+        // socket. activate() refuses outright with BadActivate.
+        use crate::vsock::unit_tests::NoopVirtioInterrupt;
+        struct DummyHandler;
+        impl vhost::vhost_user::VhostUserFrontendReqHandler for DummyHandler {}
+
+        let mut common = disconnected_common();
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
+        );
+        let kill_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let pause_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let interrupt: Arc<dyn crate::VirtioInterrupt> = Arc::new(NoopVirtioInterrupt {});
+        let backend_req: Option<FrontendReqHandler<DummyHandler>> = None;
+
+        let result = common.activate(mem, &[], interrupt, 0, backend_req, kill_evt, pause_evt);
+        assert!(matches!(result, Err(ActivateError::BadActivate)));
+    }
+}
