@@ -5,7 +5,8 @@ use std::io::ErrorKind;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::time::Duration;
 use std::{io, thread};
 
 use anyhow::anyhow;
@@ -242,6 +243,10 @@ pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
 
 const HUP_CONNECTION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const BACKEND_REQ_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
+
+/// Maximum time `VhostUserCommon::shutdown` waits for the vhost-user worker
+/// thread to exit before giving up on the join and proceeding.
+const WORKER_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub struct Inflight {
@@ -603,7 +608,21 @@ impl VhostUserCommon {
             t.thread().unpark();
         }
         if let Some(t) = self.epoll_thread.take() {
-            let _ = t.join();
+            // Bound the wait for the worker thread. The worker may be stuck on a blocking
+            // vhost-user protocol call. If it exceeds the timeout, then drop the handle and let it
+            // finish on its own.
+            let (tx, rx) = mpsc::channel::<()>();
+            let _watcher = thread::spawn(move || {
+                let _ = t.join();
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(WORKER_SHUTDOWN_JOIN_TIMEOUT).is_err() {
+                warn!(
+                    "Timed out waiting for vhost-user worker thread to exit for socket {}; \
+                     proceeding with shutdown",
+                    self.socket_path
+                );
+            }
         }
 
         // Remove socket path if needed
