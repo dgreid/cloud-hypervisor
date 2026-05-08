@@ -1834,6 +1834,12 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn test_vhost_user_blk_backend_crash() {
+        _test_vhost_user_blk_backend_crash(&prepare_vubd);
+    }
+
+    #[test]
     fn test_boot_from_vhost_user_blk_default() {
         test_boot_from_vhost_user_blk(1, false, false, Some(&prepare_vubd));
     }

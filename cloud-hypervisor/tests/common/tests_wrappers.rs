@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::string::String;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block::ImageType;
 use net_util::MacAddr;
@@ -816,6 +816,127 @@ pub(crate) fn test_vhost_user_blk(
         let _ = daemon_child.kill();
         let _ = daemon_child.wait();
     }
+
+    handle_child_output(r, &output);
+}
+
+/// End-to-end coverage for the "backend dies under us" path:
+///
+///   1. Boot a VM with a vhost-user-blk disk attached.
+///   2. SIGKILL the vhost-user-blk daemon.
+///   3. Assert the VMM is still alive (the API still responds).
+///   4. `remove-device` the dead disk and assert it succeeds promptly.
+///   5. Assert the VMM is still alive after removal.
+///
+/// Before the disconnected-flag changes, step 3 was already broken because
+/// any subsequent pause/resume would propagate `MigratableError::Resume` up
+/// through `Vm::shutdown` and crash the VMM. Step 4 was also broken because
+/// `VhostUserCommon::shutdown()` would block indefinitely on the worker
+/// thread that was sleeping in the 60 s reconnect retry.
+pub(crate) fn _test_vhost_user_blk_backend_crash(prepare_vhost_user_blk_daemon: &PrepareBlkDaemon) {
+    let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+    let guest = Guest::new(Box::new(disk_config));
+    let api_socket = temp_api_path(&guest.tmp_dir);
+    let kernel_path = direct_kernel_boot_path();
+    let num_queues = 2;
+    let blk_id = "vub0";
+
+    let (mut daemon_child, vubd_socket_path) =
+        prepare_vhost_user_blk_daemon(&guest.tmp_dir, "blk.img", num_queues, false, false);
+
+    let blk_params = format!(
+        "vhost_user=true,socket={vubd_socket_path},num_queues={num_queues},\
+         queue_size=128,id={blk_id}",
+    );
+
+    let mut child = GuestCommand::new(&guest)
+        .args(["--cpus", format!("boot={num_queues}").as_str()])
+        .args(["--memory", "size=512M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args([
+            "--disk",
+            format!(
+                "path={}",
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+            )
+            .as_str(),
+            format!(
+                "path={}",
+                guest.disk_config.disk(DiskType::CloudInit).unwrap()
+            )
+            .as_str(),
+            blk_params.as_str(),
+        ])
+        .default_net()
+        .args(["--api-socket", &api_socket])
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    // The daemon Child is moved into the closure so we don't borrow it
+    // across the unwind boundary (Child is not UnwindSafe). Guest needs
+    // AssertUnwindSafe because DiskConfig is a trait object without an
+    // UnwindSafe bound; assertion failures here don't leave behind any
+    // shared state we'd need to recover from.
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        guest.wait_vm_boot().unwrap();
+
+        // Sanity: the vhost-user disk is visible inside the guest.
+        assert_eq!(
+            guest
+                .ssh_command("lsblk | grep vdc | grep -c 16M")
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default(),
+            1
+        );
+
+        // Kill the vhost-user backend out from under the VMM.
+        daemon_child.kill().unwrap();
+        let _ = daemon_child.wait();
+
+        // The VMM must remain responsive. Poll the API for a short window
+        // to ride out the worker-thread teardown.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                remote_command(&api_socket, "info", None)
+            }),
+            "VMM API stopped responding after vhost-user backend crash"
+        );
+
+        // Unplug the now-dead device. With the disconnected flag this must
+        // succeed quickly (well under the bounded 5 s join in
+        // VhostUserCommon::shutdown()).
+        let unplug_start = Instant::now();
+        assert!(
+            remote_command(&api_socket, "remove-device", Some(blk_id)),
+            "remove-device for dead vhost-user-blk failed"
+        );
+        let unplug_elapsed = unplug_start.elapsed();
+        assert!(
+            unplug_elapsed < Duration::from_secs(15),
+            "remove-device for dead vhost-user-blk took too long: {unplug_elapsed:?}"
+        );
+
+        // VMM still alive after the unplug.
+        assert!(
+            remote_command(&api_socket, "info", None),
+            "VMM API stopped responding after remove-device"
+        );
+
+        // Wait for the disk to disappear from the guest.
+        assert!(
+            wait_until(Duration::from_secs(15), || guest
+                .ssh_command("lsblk | grep -c vdc.*16M || true")
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)),
+            "vhost-user-blk disk did not disappear from the guest after remove-device"
+        );
+    }));
+
+    kill_child(&mut child);
+    let output = child.wait_with_output().unwrap();
 
     handle_child_output(r, &output);
 }
