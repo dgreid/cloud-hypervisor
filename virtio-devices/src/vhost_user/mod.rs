@@ -4,7 +4,7 @@
 use std::io::ErrorKind;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::Duration;
 use std::{io, thread};
@@ -269,6 +269,12 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     pub inflight: Option<Inflight>,
     /// Flag set by the worker when the vhost-user backend is no longer reachable.
     pub disconnected: Arc<AtomicBool>,
+    /// Cached raw fd of the active backend socket (`-1` if no connection).
+    /// The worker stores the fd here after each successful (re)connect; the
+    /// owning [`VhostUserCommon`] reads it to call `shutdown(SHUT_RDWR)` on the
+    /// socket without taking the [`VhostUserHandle`] mutex, forcibly
+    /// unblocking any in-flight protocol round-trip the worker is parked in.
+    pub peer_socket_fd: Arc<AtomicI32>,
 }
 
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
@@ -347,15 +353,17 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
                 )))
             })?;
 
-        helper.add_event_custom(
-            vhost_user.socket_handle().as_raw_fd(),
-            HUP_CONNECTION_EVENT,
-            epoll::Events::EPOLLHUP,
-        )?;
+        let new_fd = vhost_user.socket_handle().as_raw_fd();
+        helper.add_event_custom(new_fd, HUP_CONNECTION_EVENT, epoll::Events::EPOLLHUP)?;
 
         // Update vhost-user reference
         let mut vu = self.vu.lock().unwrap();
         *vu = vhost_user;
+        // Publish the new fd so a concurrent shutdown/reset can use it to
+        // unblock future round-trips against this connection. Order: only
+        // after `*vu` has been replaced, since the old fd is closed when
+        // the previous handle is dropped.
+        self.peer_socket_fd.store(new_fd, Ordering::Relaxed);
 
         Ok(())
     }
@@ -431,7 +439,10 @@ impl<C> VhostUserState<C> {
     }
 }
 
-#[derive(Default)]
+/// Sentinel value stored in `VhostUserCommon::peer_socket_fd` when there is
+/// no live backend connection.
+const NO_PEER_FD: i32 = -1;
+
 pub struct VhostUserCommon {
     pub virtio_common: VirtioCommon,
     pub vu: Option<Arc<Mutex<VhostUserHandle>>>,
@@ -444,6 +455,30 @@ pub struct VhostUserCommon {
     pub epoll_thread: Option<thread::JoinHandle<()>>,
     /// Indicates that the backend is no longer reachable. Shared with EPollHandler.
     pub disconnected: Arc<AtomicBool>,
+    /// Cached raw fd of the active backend socket, or `NO_PEER_FD` if no
+    /// connection is established. The worker stores the fd here after each
+    /// successful (re)connect; teardown paths read it to call
+    /// `shutdown(SHUT_RDWR)` and unblock any in-flight protocol round-trip
+    /// without taking the [`VhostUserHandle`] mutex.
+    pub peer_socket_fd: Arc<AtomicI32>,
+}
+
+impl Default for VhostUserCommon {
+    fn default() -> Self {
+        Self {
+            virtio_common: VirtioCommon::default(),
+            vu: None,
+            acked_protocol_features: 0,
+            socket_path: String::new(),
+            vu_num_queues: 0,
+            migration_started: false,
+            server: false,
+            vring_bases: None,
+            epoll_thread: None,
+            disconnected: Arc::new(AtomicBool::new(false)),
+            peer_socket_fd: Arc::new(AtomicI32::new(NO_PEER_FD)),
+        }
+    }
 }
 
 impl VhostUserCommon {
@@ -484,18 +519,25 @@ impl VhostUserCommon {
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
         let vring_bases = self.vring_bases.take();
-        vu.lock()
-            .unwrap()
-            .setup_vhost_user(
-                &mem.memory(),
-                &queues,
-                interrupt_cb.as_ref(),
-                acked_features,
-                &backend_req_handler,
-                inflight.as_mut(),
-                vring_bases.as_deref(),
-            )
-            .map_err(ActivateError::VhostUserSetup)?;
+        let socket_fd = {
+            let mut handle = vu.lock().unwrap();
+            handle
+                .setup_vhost_user(
+                    &mem.memory(),
+                    &queues,
+                    interrupt_cb.as_ref(),
+                    acked_features,
+                    &backend_req_handler,
+                    inflight.as_mut(),
+                    vring_bases.as_deref(),
+                )
+                .map_err(ActivateError::VhostUserSetup)?;
+            handle.socket_handle().as_raw_fd()
+        };
+        // Publish the fd so an unplug/reset on this device can use
+        // shutdown(SHUT_RDWR) to abort an in-flight protocol round-trip
+        // without contending for the VhostUserHandle mutex.
+        self.peer_socket_fd.store(socket_fd, Ordering::Relaxed);
 
         Ok(VhostUserEpollHandler {
             vu: vu.clone(),
@@ -511,6 +553,7 @@ impl VhostUserCommon {
             backend_req_handler,
             inflight,
             disconnected: self.disconnected.clone(),
+            peer_socket_fd: self.peer_socket_fd.clone(),
         })
     }
 
@@ -578,6 +621,7 @@ impl VhostUserCommon {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
+        self.unblock_worker_round_trip();
 
         event!("virtio-device", "reset", "id", id);
 
@@ -594,6 +638,39 @@ impl VhostUserCommon {
         }
     }
 
+    /// Force-tear-down the read/write half of the cached backend socket so any
+    /// in-flight vhost-user protocol round-trip the worker is parked in
+    /// returns immediately with `EOF`/`EPIPE`, rather than blocking on an
+    /// unresponsive peer (no socket-level timeout exists in the protocol).
+    ///
+    /// Caller must have already signalled `kill_evt`, so the worker exits its
+    /// run loop instead of trying to keep going on the half-closed socket.
+    /// The cached fd is published by `activate()` and refreshed by
+    /// `VhostUserEpollHandler::reconnect_inner` on each successful reconnect.
+    /// Idempotent: subsequent calls observe `NO_PEER_FD` and do nothing.
+    fn unblock_worker_round_trip(&self) {
+        let fd = self.peer_socket_fd.swap(NO_PEER_FD, Ordering::Relaxed);
+        if fd == NO_PEER_FD {
+            return;
+        }
+        // SAFETY: fd was published by the worker after a successful connect,
+        // referring to a Unix-domain stream socket owned by the live
+        // VhostUserHandle. There is a narrow race with the worker
+        // reconnecting and closing the old fd just before we shutdown; in
+        // that case shutdown returns EBADF, which is harmless.
+        let r = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            // EBADF / ENOTCONN are expected during teardown races.
+            if !matches!(err.raw_os_error(), Some(libc::EBADF) | Some(libc::ENOTCONN)) {
+                warn!(
+                    "shutdown(SHUT_RDWR) on vhost-user socket {} (fd {fd}) failed: {err}",
+                    self.socket_path
+                );
+            }
+        }
+    }
+
     pub fn shutdown(&mut self) {
         // Signal the epoll thread to exit, unpause it (it may be parked
         // if the VM was paused for migration), then wait for it to finish.
@@ -603,6 +680,12 @@ impl VhostUserCommon {
         if let Some(kill_evt) = self.virtio_common.kill_evt.take() {
             let _ = kill_evt.write(1);
         }
+        // Unblock any in-flight protocol round-trip the worker is parked in
+        // (e.g. blocking recvmsg on an unresponsive backend) before we wait
+        // on the join. With this, the bounded join below is only ever a
+        // safety net for the rarer "worker is in the reconnect retry sleep"
+        // case — actual protocol round-trips return promptly.
+        self.unblock_worker_round_trip();
         self.virtio_common.paused.store(false, Ordering::SeqCst);
         if let Some(t) = self.epoll_thread.as_ref() {
             t.thread().unpark();
@@ -1016,5 +1099,56 @@ mod tests {
 
         let result = common.activate(mem, &[], interrupt, 0, backend_req, kill_evt, pause_evt);
         assert!(matches!(result, Err(ActivateError::BadActivate)));
+    }
+
+    #[test]
+    fn unblock_worker_round_trip_aborts_blocking_recv() {
+        // The cached peer fd lets the teardown path force-abort whatever
+        // protocol round-trip the worker is parked in. Simulate it by
+        // creating a real socketpair, publishing one end as
+        // peer_socket_fd, and asserting that a blocking recv on the
+        // *other* end returns 0 (EOF) once unblock_worker_round_trip()
+        // shuts the connection down.
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream;
+
+        let (worker_side, peer) = UnixStream::pair().expect("socketpair");
+        let peer_fd = peer.into_raw_fd();
+
+        let common = VhostUserCommon {
+            socket_path: "/test/vhost-user-unblock.sock".to_string(),
+            vu_num_queues: 0,
+            ..Default::default()
+        };
+        common.peer_socket_fd.store(peer_fd, Ordering::Relaxed);
+
+        // Stand-in for the worker: hand off the worker side to a thread
+        // that blocks reading from it. Without unblock_worker_round_trip,
+        // the read would wait forever for data that never arrives.
+        let worker = thread::spawn(move || {
+            use std::io::Read;
+            let mut s = worker_side;
+            let mut buf = [0u8; 16];
+            s.read(&mut buf).unwrap_or(0)
+        });
+
+        common.unblock_worker_round_trip();
+
+        // The worker thread should now wake up promptly with EOF.
+        let bytes_read = worker.join().expect("worker join");
+        assert_eq!(
+            bytes_read, 0,
+            "worker recv should return EOF after shutdown"
+        );
+        // Sentinel was written back so a second call is a no-op.
+        assert_eq!(common.peer_socket_fd.load(Ordering::Relaxed), NO_PEER_FD);
+        common.unblock_worker_round_trip();
+
+        // Reclaim the dup'd peer fd so the test doesn't leak it.
+        // SAFETY: the fd was created by UnixStream::pair() in this test
+        // and has not been handed out to anyone else.
+        unsafe {
+            let _ = UnixStream::from_raw_fd(peer_fd);
+        }
     }
 }
