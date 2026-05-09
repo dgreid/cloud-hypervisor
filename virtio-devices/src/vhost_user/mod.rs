@@ -1,6 +1,7 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::io::ErrorKind;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ use log::error;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vhost::Error as VhostError;
+use vhost::vhost_user::Error as VhostUserError;
 use vhost::vhost_user::message::{
     VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
@@ -73,6 +75,8 @@ pub enum Error {
     VhostUserOpen(#[source] VhostError),
     #[error("Connection to socket failed")]
     VhostUserConnect,
+    #[error("Backend disconnected for socket {0}")]
+    BackendDisconnected(String),
     #[error("Get features failed")]
     VhostUserGetFeatures(#[source] VhostError),
     #[error("Get queue max number failed")]
@@ -161,6 +165,72 @@ pub enum Error {
     InconsistentBackendState,
 }
 type Result<T> = std::result::Result<T, Error>;
+
+fn io_error_is_connection_lost(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
+}
+
+fn vhost_user_error_is_transport_lost(error: &VhostUserError) -> bool {
+    match error {
+        VhostUserError::Disconnected
+        | VhostUserError::PartialMessage
+        | VhostUserError::SocketBroken(_)
+        | VhostUserError::SocketConnect(_) => true,
+        VhostUserError::SocketError(e) => io_error_is_connection_lost(e),
+        _ => false,
+    }
+}
+
+fn vhost_error_is_transport_lost(error: &VhostError) -> bool {
+    match error {
+        VhostError::VhostUserProtocol(e) => vhost_user_error_is_transport_lost(e),
+        VhostError::IOError(e) => io_error_is_connection_lost(e),
+        _ => false,
+    }
+}
+
+impl Error {
+    fn is_transport_lost(&self) -> bool {
+        match self {
+            Error::VhostUserConnect | Error::BackendDisconnected(_) => true,
+            Error::VhostUserCreateFrontend(e)
+            | Error::VhostUserOpen(e)
+            | Error::VhostUserGetFeatures(e)
+            | Error::VhostUserGetQueueMaxNum(e)
+            | Error::VhostUserGetProtocolFeatures(e)
+            | Error::VhostUserGetVringBase(e)
+            | Error::VhostUserSetOwner(e)
+            | Error::VhostUserResetOwner(e)
+            | Error::VhostUserSetFeatures(e)
+            | Error::VhostUserSetProtocolFeatures(e)
+            | Error::VhostUserSetMemTable(e)
+            | Error::VhostUserSetVringNum(e)
+            | Error::VhostUserSetVringAddr(e)
+            | Error::VhostUserSetVringBase(e)
+            | Error::VhostUserSetVringCall(e)
+            | Error::VhostUserSetVringKick(e)
+            | Error::VhostUserSetVringEnable(e)
+            | Error::VhostUserSetBackendRequestFd(e)
+            | Error::VhostUserAddMemReg(e)
+            | Error::VhostUserGetConfig(e)
+            | Error::VhostUserSetConfig(e)
+            | Error::VhostUserGetInflight(e)
+            | Error::VhostUserSetInflight(e)
+            | Error::VhostUserSetLogBase(e)
+            | Error::VhostUserSetDeviceStateFd(e)
+            | Error::VhostUserCheckDeviceState(e) => vhost_error_is_transport_lost(e),
+            Error::FrontendReqHandlerCreation(e) => vhost_user_error_is_transport_lost(e),
+            _ => false,
+        }
+    }
+}
 
 pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
     | (1 << VIRTIO_F_RING_EVENT_IDX)
