@@ -10,15 +10,14 @@ use std::{io, thread};
 
 use anyhow::anyhow;
 use event_monitor::event;
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vhost::Error as VhostError;
-use vhost::vhost_user::Error as VhostUserError;
 use vhost::vhost_user::message::{
     VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
-use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontendReqHandler};
+use vhost::vhost_user::{Error as VhostUserError, FrontendReqHandler, VhostUserFrontendReqHandler};
 use virtio_queue::{Error as QueueError, Queue};
 use vm_memory::guest_memory::Error as MmapError;
 use vm_memory::mmap::MmapRegionError;
@@ -503,16 +502,31 @@ impl VhostUserCommon {
     }
 
     pub fn restore_backend_connection(&mut self, acked_features: u64) -> Result<()> {
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            self.server,
-            &self.socket_path,
-            self.vu_num_queues as u64,
-            false,
-        )?;
+        let connect = || -> Result<VhostUserHandle> {
+            let mut vu = VhostUserHandle::connect_vhost_user(
+                self.server,
+                &self.socket_path,
+                self.vu_num_queues as u64,
+                false,
+            )?;
 
-        vu.set_protocol_features_vhost_user(acked_features, self.acked_protocol_features)?;
+            vu.set_protocol_features_vhost_user(acked_features, self.acked_protocol_features)?;
+            Ok(vu)
+        };
 
-        self.vu = Some(Arc::new(Mutex::new(vu)));
+        match connect() {
+            Ok(vu) => {
+                self.vu = Some(Arc::new(Mutex::new(vu)));
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to restore vhost-user backend connection for socket {}: {e:?}; \
+                     marking device as disconnected",
+                    self.socket_path
+                );
+                self.disconnected.store(true, Ordering::Relaxed);
+            }
+        }
 
         Ok(())
     }
