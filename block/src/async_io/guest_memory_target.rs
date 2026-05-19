@@ -60,7 +60,6 @@ where
 /// carries no `Unique`/`noalias` semantics that could conflict with kernel
 /// asynchronous access. This matches `OwnedIoBuffer`'s iovec storage.
 pub struct GuestMemoryTarget {
-    #[allow(dead_code)]
     owner: Arc<dyn GuestMemoryTargetOwner>,
     ranges: SmallVec<[(GuestAddress, usize); 1]>,
     iovecs: Vec<libc::iovec>,
@@ -122,7 +121,6 @@ impl GuestMemoryTarget {
         self.ranges.iter().map(|(_, len)| len).sum()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn write_bytes_at(&self, start: usize, data: &[u8]) -> Result<(), GuestMemoryError> {
         self.for_each_range(start, data.len(), |addr, offset, len| {
             self.owner
@@ -130,7 +128,6 @@ impl GuestMemoryTarget {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn read_bytes_at(
         &self,
         start: usize,
@@ -142,7 +139,6 @@ impl GuestMemoryTarget {
         })
     }
 
-    #[allow(dead_code)]
     pub(crate) fn fill_zeroes_at(&self, start: usize, len: usize) -> Result<(), GuestMemoryError> {
         let zeroes = [0u8; 4096];
         self.for_each_range(start, len, |addr, _, mut len| {
@@ -160,7 +156,6 @@ impl GuestMemoryTarget {
         })
     }
 
-    #[allow(dead_code)]
     fn for_each_range<F>(&self, start: usize, len: usize, mut f: F) -> Result<(), GuestMemoryError>
     where
         F: FnMut(GuestAddress, usize, usize) -> Result<(), GuestMemoryError>,
@@ -200,7 +195,6 @@ impl GuestMemoryTarget {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn validate_range(&self, start: usize, len: usize) -> Result<(), GuestMemoryError> {
         let total_len = self.total_len();
         if start <= total_len
