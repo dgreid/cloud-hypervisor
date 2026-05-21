@@ -2022,6 +2022,31 @@ mod common_parallel {
         test_boot_from_vhost_user_blk(1, false, false, Some(&prepare_vubd));
     }
 
+    // Eject a vhost-user-blk device while the guest has direct-I/O in
+    // flight and the backend daemon has been SIGKILLed. Without the
+    // `vhost-user-blk: fail in-flight descriptors immediately on remove`
+    // fix this test would hang for the full 60s vhost-user reconnect
+    // window because the guest's `virtblk_remove()` blocks in
+    // `del_gendisk()` waiting for bios that will never complete. With
+    // the fix the eject completes in ~1-2s.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn test_vhost_user_blk_eject_after_backend_death() {
+        _test_vhost_user_blk_eject(true);
+    }
+
+    // Same scaffolding as above but the backend stays alive. Validates
+    // that the fast-fail-on-remove path does not synthesize spurious
+    // IOERR completions on the healthy unplug path: in-flight requests
+    // must complete with real status from the live backend, and the
+    // guest must not log any `I/O error, dev vdc` lines during the
+    // unplug window.
+    #[test]
+    #[cfg(not(target_arch = "aarch64"))]
+    fn test_vhost_user_blk_eject_healthy() {
+        _test_vhost_user_blk_eject(false);
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_split_irqchip() {

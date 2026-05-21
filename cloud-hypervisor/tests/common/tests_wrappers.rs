@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::string::String;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block::ImageType;
 use net_util::MacAddr;
@@ -827,6 +827,226 @@ pub(crate) fn test_vhost_user_blk(
     let output = child.wait_with_output().unwrap();
 
     if let Some(mut daemon_child) = daemon_child {
+        let _ = daemon_child.kill();
+        let _ = daemon_child.wait();
+    }
+
+    handle_child_output(r, &output);
+}
+
+/// Shared driver for the vhost-user-blk hot-remove tests.
+///
+/// Boots a guest with a `vhost-user-blk` secondary disk (id=`vublk0`), starts
+/// `fio` inside the guest to drive direct-I/O against the device so that the
+/// virtio queues always have real in-flight descriptors, then asks CH to
+/// detach the device and measures how long the detach takes.
+///
+/// When `kill_backend` is true, the `vhost_user_block` daemon is SIGKILLed
+/// before `remove-device` is issued. This reproduces the original bug where
+/// the guest's `virtblk_remove()` hung on `del_gendisk()` waiting for bios
+/// that could never complete, causing the ACPI eject to time out (~60s).
+/// With the `vhost-user-blk: fail in-flight descriptors immediately on remove`
+/// fix the detach must complete in well under 5s.
+///
+/// When `kill_backend` is false, the daemon stays alive. This validates that
+/// the fast-fail path does not synthesize spurious IOERR completions on the
+/// healthy unplug path: in-flight requests must drain via real status from
+/// the live backend, and the guest console must not log any
+/// `I/O error, dev vdc` lines during the unplug window.
+pub(crate) fn _test_vhost_user_blk_eject(kill_backend: bool) {
+    let num_queues: usize = 2;
+    let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+    let guest = Guest::new(Box::new(disk_config));
+    let api_socket = temp_api_path(&guest.tmp_dir);
+
+    let kernel_path = direct_kernel_boot_path();
+
+    // Spawn the vhost-user-block daemon. `prepare_vubd` looks for the backing
+    // file under ~/workloads, which is where the integration test harness
+    // puts `blk.img` (16 MiB ext4). `direct=false` is fine on the host side;
+    // the guest opens with O_DIRECT either way, which is what we need to keep
+    // descriptors in flight at the moment the backend dies.
+    let (mut daemon_child, vubd_socket_path) =
+        prepare_vubd(&guest.tmp_dir, "blk.img", num_queues, false, false);
+
+    let blk_params = format!(
+        "vhost_user=true,socket={vubd_socket_path},num_queues={num_queues},queue_size=128,id=vublk0",
+    );
+
+    let mut child = GuestCommand::new(&guest)
+        .args(["--cpus", format!("boot={num_queues}").as_str()])
+        .args(["--memory", "size=512M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args([
+            "--disk",
+            format!(
+                "path={}",
+                guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+            )
+            .as_str(),
+            format!(
+                "path={}",
+                guest.disk_config.disk(DiskType::CloudInit).unwrap()
+            )
+            .as_str(),
+            blk_params.as_str(),
+        ])
+        .default_net()
+        .args(["--api-socket", &api_socket])
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    // Track whether we killed the daemon ourselves so the cleanup below does
+    // not double-reap.
+    let mut backend_killed = false;
+
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        guest.wait_vm_boot().unwrap();
+
+        // Sanity: vdc is the vhost-user-blk device.
+        assert_eq!(
+            guest
+                .ssh_command("lsblk | grep -c '^vdc'")
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default(),
+            1,
+            "vhost-user-blk device did not appear as /dev/vdc"
+        );
+
+        // Start an I/O hog that keeps many direct-I/O reads in flight.
+        // The custom jammy test image ships fio (installed by
+        // scripts/build-custom-image.sh). We background it with nohup and
+        // throw away output so the SSH command returns immediately.
+        //
+        // `--direct=1` is critical: without O_DIRECT the page cache absorbs
+        // the reads and zero descriptors ever sit on the virtio queues, so
+        // killing the backend would not reproduce the original hang.
+        guest
+            .ssh_command(
+                "sudo sh -c 'nohup fio --filename=/dev/vdc --rw=randread --bs=4k \
+                 --direct=1 --ioengine=libaio --iodepth=32 --numjobs=8 \
+                 --time_based --runtime=300 --name=iohog \
+                 >/tmp/fio.log 2>&1 &'",
+            )
+            .unwrap();
+
+        // Confirm there are real in-flight requests on /dev/vdc. The kernel
+        // exposes inflight as "<reads> <writes>" in /sys/block/<dev>/inflight.
+        // We poll for up to 10s; this is also what gates the rest of the
+        // test from being a false negative.
+        let saw_inflight = wait_until(Duration::from_secs(10), || {
+            let out = match guest.ssh_command("cat /sys/block/vdc/inflight") {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let nums: Vec<u64> = out
+                .split_whitespace()
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            nums.iter().any(|n| *n > 0)
+        });
+        assert!(
+            saw_inflight,
+            "fio did not produce any in-flight I/O on /dev/vdc; \
+             cannot meaningfully exercise the eject-with-pending-IO path"
+        );
+
+        // Snapshot dmesg so we can scan only the unplug window for new
+        // I/O error lines in the healthy case.
+        let dmesg_lines_before: usize = guest
+            .ssh_command("dmesg | wc -l")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        if kill_backend {
+            // SIGKILL the vhost-user-blk daemon while guest I/O is in flight.
+            // From this point on the virtio queues will never drain through
+            // the normal path, so the eject's success depends on CH's
+            // fast-fail-on-remove logic.
+            daemon_child.kill().expect("failed to SIGKILL vhost_user_block");
+            let _ = daemon_child.wait();
+            backend_killed = true;
+
+            // Give the guest a brief moment to notice. Not strictly required;
+            // mirrors the standalone reproducer.
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        // Issue remove-device and start the clock. ch-remote returns almost
+        // immediately (it just sets a bit and fires the ACPI SCI), so what
+        // we actually time is how long the device takes to disappear from
+        // the VM's device_tree.
+        let t0 = Instant::now();
+        assert!(
+            remote_command(&api_socket, "remove-device", Some("vublk0")),
+            "ch-remote remove-device vublk0 failed"
+        );
+
+        // Poll vm.info every 100ms for the device to drop out of device_tree.
+        // The standalone reproducer keys on "_virtio-pci-vublk0" and
+        // "vublk0"; either presence means the eject has not completed.
+        let gone = wait_until(Duration::from_secs(30), || {
+            let (ok, out, _) = remote_command_w_output(&api_socket, "info", None);
+            if !ok {
+                return false;
+            }
+            let info: serde_json::Value = match serde_json::from_slice(&out) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let dt = match info.get("device_tree").and_then(|d| d.as_object()) {
+                Some(dt) => dt,
+                None => return false,
+            };
+            !dt.keys().any(|k| k.contains("vublk0"))
+        });
+        let elapsed = t0.elapsed();
+
+        assert!(
+            gone,
+            "vublk0 still present in device_tree after {elapsed:?}; \
+             remove-device hung (the bug this test guards against)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "vublk0 detach took {elapsed:?}, expected < 5s; \
+             the vhost-user-blk fast-fail-on-remove fix appears regressed"
+        );
+
+        if !kill_backend {
+            // Healthy unplug: the VM is still up and the backend is alive.
+            // The guest must not have logged any synthetic I/O errors on
+            // /dev/vdc during the unplug window.
+            let dmesg_now: String = guest.ssh_command("dmesg").unwrap();
+            let new_tail: String = dmesg_now
+                .lines()
+                .skip(dmesg_lines_before)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ioerr_lines: Vec<&str> = new_tail
+                .lines()
+                .filter(|l| l.contains("I/O error, dev vdc"))
+                .collect();
+            assert!(
+                ioerr_lines.is_empty(),
+                "healthy unplug regression: guest emitted {} I/O error line(s) \
+                 on /dev/vdc during the unplug window; first: {:?}",
+                ioerr_lines.len(),
+                ioerr_lines.first()
+            );
+        }
+    }));
+
+    kill_child(&mut child);
+    let output = child.wait_with_output().unwrap();
+
+    if !backend_killed {
         let _ = daemon_child.kill();
         let _ = daemon_child.wait();
     }
