@@ -137,11 +137,15 @@ where
             ) {
                 Ok(mut pkt) => {
                     if self.backend.write().unwrap().recv_pkt(&mut pkt).is_ok() {
-                        match pkt.commit_hdr(&*self.mem.memory()) {
+                        let mem = self.mem.memory();
+                        match pkt
+                            .commit_buf(&*mem)
+                            .and_then(|()| pkt.commit_hdr(&*mem))
+                        {
                             Ok(()) => pkt.hdr().len() as u32 + pkt.len(),
                             Err(err) => {
                                 warn!(
-                                    "vsock: Error writing packet header to guest memory: \
+                                    "vsock: Error writing packet to guest memory: \
                                      {err:?}. Discarding the package."
                                 );
                                 0
