@@ -23,8 +23,6 @@ use vm_memory::{Address, Bytes, GuestAddress, GuestMemory};
 use vm_virtio::{AccessPlatform, Translatable};
 
 use super::{Result, VsockError, defs};
-#[cfg(test)]
-use crate::get_host_address_range;
 
 // The vsock packet header is defined by the C struct:
 //
@@ -553,12 +551,11 @@ mod unit_tests {
 
     fn set_pkt_len(len: u32, guest_desc: &GuestQDesc, mem: &GuestMemoryMmap) {
         let hdr_gpa = guest_desc.addr.get();
-        let hdr_ptr =
-            get_host_address_range(mem, GuestAddress(hdr_gpa), VSOCK_PKT_HDR_SIZE).unwrap();
-        // SAFETY: The length is valid.
-        let len_ptr = unsafe { hdr_ptr.add(HDROFF_LEN) };
-        // SAFETY: The length is valid.
-        LittleEndian::write_u32(unsafe { std::slice::from_raw_parts_mut(len_ptr, 4) }, len);
+        mem.write_slice(
+            &len.to_le_bytes(),
+            GuestAddress(hdr_gpa + HDROFF_LEN as u64),
+        )
+        .unwrap();
     }
 
     #[test]
