@@ -24,7 +24,9 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(not(target_arch = "riscv64"))]
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{iter, path, result, sync};
@@ -577,6 +579,18 @@ pub enum DeviceManagerError {
     #[error("Failed to request virtio-balloon statistics")]
     VirtioBalloonStats(#[source] balloon::Error),
 
+    /// Guest returned invalid virtio-balloon statistics.
+    #[error("Guest returned invalid virtio-balloon statistics")]
+    InvalidVirtioBalloonStats(#[source] balloon::BalloonStatsError),
+
+    /// Timed out waiting for virtio-balloon statistics.
+    #[error("Timed out waiting for virtio-balloon statistics")]
+    VirtioBalloonStatsTimeout,
+
+    /// Virtio-balloon statistics worker disconnected.
+    #[error("Virtio-balloon statistics worker disconnected")]
+    VirtioBalloonStatsDisconnected,
+
     /// Missing virtio-balloon, can't proceed as expected.
     #[error("Missing virtio-balloon, can't proceed as expected")]
     MissingVirtioBalloon,
@@ -705,6 +719,29 @@ pub enum DeviceManagerError {
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
+
+#[must_use = "The balloon statistics response must be collected"]
+pub struct BalloonStatsRequest {
+    balloon_actual: u64,
+    response_receiver:
+        Receiver<result::Result<virtio_devices::BalloonStatsSnapshot, balloon::BalloonStatsError>>,
+}
+
+impl BalloonStatsRequest {
+    pub fn wait(
+        self,
+        timeout: Duration,
+    ) -> DeviceManagerResult<(u64, virtio_devices::BalloonStatsSnapshot)> {
+        match self.response_receiver.recv_timeout(timeout) {
+            Ok(Ok(stats)) => Ok((self.balloon_actual, stats)),
+            Ok(Err(error)) => Err(DeviceManagerError::InvalidVirtioBalloonStats(error)),
+            Err(RecvTimeoutError::Timeout) => Err(DeviceManagerError::VirtioBalloonStatsTimeout),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(DeviceManagerError::VirtioBalloonStatsDisconnected)
+            }
+        }
+    }
+}
 
 const DEVICE_MANAGER_ACPI_SIZE: usize = 0x10;
 
@@ -5472,16 +5509,20 @@ impl DeviceManager {
         0
     }
 
-    pub fn balloon_stats(&self) -> DeviceManagerResult<virtio_devices::BalloonStatsSnapshot> {
+    pub fn request_balloon_stats(&self) -> DeviceManagerResult<BalloonStatsRequest> {
         let balloon = self
             .balloon
             .as_ref()
             .ok_or(DeviceManagerError::MissingVirtioBalloon)?;
-        balloon
-            .lock()
-            .unwrap()
-            .stats()
-            .map_err(DeviceManagerError::VirtioBalloonStats)
+        let balloon = balloon.lock().unwrap();
+        let response_receiver = balloon
+            .begin_stats_request()
+            .map_err(DeviceManagerError::VirtioBalloonStats)?;
+
+        Ok(BalloonStatsRequest {
+            balloon_actual: balloon.get_actual(),
+            response_receiver,
+        })
     }
 
     pub fn resize_disk(&mut self, device_id: &str, new_size: u64) -> DeviceManagerResult<()> {
@@ -6152,7 +6193,78 @@ impl Drop for DeviceManager {
 
 #[cfg(test)]
 mod unit_tests {
+    use std::sync::mpsc::sync_channel;
+
     use super::*;
+
+    fn balloon_stats_request(
+        balloon_actual: u64,
+        response_receiver: Receiver<
+            result::Result<virtio_devices::BalloonStatsSnapshot, balloon::BalloonStatsError>,
+        >,
+    ) -> BalloonStatsRequest {
+        BalloonStatsRequest {
+            balloon_actual,
+            response_receiver,
+        }
+    }
+
+    #[test]
+    fn balloon_stats_request_returns_response() {
+        let (response_sender, response_receiver) = sync_channel(1);
+        response_sender
+            .send(Ok(virtio_devices::BalloonStatsSnapshot {
+                stats: virtio_devices::BalloonStats {
+                    free_memory: Some(1024),
+                    ..Default::default()
+                },
+                last_update: 1234,
+            }))
+            .unwrap();
+
+        let (actual, snapshot) = balloon_stats_request(4096, response_receiver)
+            .wait(Duration::ZERO)
+            .unwrap();
+        assert_eq!(actual, 4096);
+        assert_eq!(snapshot.last_update, 1234);
+        assert_eq!(snapshot.stats.free_memory, Some(1024));
+    }
+
+    #[test]
+    fn balloon_stats_request_times_out() {
+        let (_response_sender, response_receiver) = sync_channel(1);
+
+        assert!(matches!(
+            balloon_stats_request(0, response_receiver).wait(Duration::ZERO),
+            Err(DeviceManagerError::VirtioBalloonStatsTimeout)
+        ));
+    }
+
+    #[test]
+    fn balloon_stats_request_maps_device_error() {
+        let (response_sender, response_receiver) = sync_channel(1);
+        response_sender
+            .send(Err(balloon::BalloonStatsError::InvalidBufferLength(1)))
+            .unwrap();
+
+        assert!(matches!(
+            balloon_stats_request(0, response_receiver).wait(Duration::ZERO),
+            Err(DeviceManagerError::InvalidVirtioBalloonStats(
+                balloon::BalloonStatsError::InvalidBufferLength(1)
+            ))
+        ));
+    }
+
+    #[test]
+    fn balloon_stats_request_detects_disconnect() {
+        let (response_sender, response_receiver) = sync_channel(1);
+        drop(response_sender);
+
+        assert!(matches!(
+            balloon_stats_request(0, response_receiver).wait(Duration::ZERO),
+            Err(DeviceManagerError::VirtioBalloonStatsDisconnected)
+        ));
+    }
 
     #[test]
     fn test_s5_sleep_state_uses_complete_package() {

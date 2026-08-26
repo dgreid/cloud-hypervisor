@@ -19,7 +19,7 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp, mem, result};
 
@@ -153,7 +153,55 @@ pub enum BalloonStatsError {
 }
 
 type BalloonStatsResult = result::Result<BalloonStats, BalloonStatsError>;
-type BalloonStatsCache = Arc<Mutex<Option<BalloonStatsSnapshot>>>;
+type BalloonStatsRequestResult = result::Result<BalloonStatsSnapshot, BalloonStatsError>;
+
+mod pending_stats {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub(super) struct Guard(Arc<AtomicBool>);
+
+    impl Guard {
+        pub(super) fn try_acquire(pending: Arc<AtomicBool>) -> Option<Self> {
+            pending
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .ok()
+                .map(|_| Self(pending))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+struct StatsRequest {
+    // Drop before response_sender so disconnect cannot race a retry.
+    pending_guard: pending_stats::Guard,
+    response_sender: Sender<BalloonStatsRequestResult>,
+}
+
+impl StatsRequest {
+    fn try_new(pending: Arc<AtomicBool>) -> Option<(Self, Receiver<BalloonStatsRequestResult>)> {
+        let pending_guard = pending_stats::Guard::try_acquire(pending)?;
+        let (response_sender, response_receiver) = mpsc::channel();
+
+        Some((
+            Self {
+                pending_guard,
+                response_sender,
+            },
+            response_receiver,
+        ))
+    }
+
+    fn complete(self, result: BalloonStatsRequestResult) {
+        drop(self.pending_guard);
+        let _ = self.response_sender.send(result);
+    }
+}
 
 fn parse_balloon_stats(data: &[u8]) -> BalloonStatsResult {
     let entries = <[BalloonStat]>::ref_from_bytes(data)
@@ -204,6 +252,8 @@ pub enum Error {
     StatsNotNegotiated,
     #[error("Balloon statistics worker is unavailable")]
     StatsWorkerUnavailable,
+    #[error("Balloon statistics request is already pending")]
+    StatsRequestPending,
     #[error("Failed to signal balloon statistics request")]
     StatsRequestSignal(#[source] io::Error),
 }
@@ -270,16 +320,16 @@ unsafe impl ByteValued for VirtioBalloonConfig {}
 
 enum BalloonStatsState {
     WaitingForInitialDescriptor,
+    PendingWaitingForInitialDescriptor { request: StatsRequest },
     Idle { descriptor_index: u16 },
-    Pending,
+    Pending { request: StatsRequest },
 }
 
 struct BalloonStatsHandler {
     queue_evt: EventFd,
     queue_index: usize,
     request_evt: EventFd,
-    request_receiver: Receiver<()>,
-    stats_cache: BalloonStatsCache,
+    request_receiver: Receiver<StatsRequest>,
     state: BalloonStatsState,
 }
 
@@ -548,48 +598,60 @@ impl BalloonEpollHandler {
             return Ok(());
         };
         let descriptor_index = desc_chain.head_index();
-        let stats = Self::parse_stats_descriptor(&mut desc_chain, self.access_platform.as_deref());
-
-        let stats_handler = self.stats_handler.as_mut().unwrap();
-        match stats {
-            Ok(stats) => {
-                let last_update = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |duration| {
-                        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-                    });
-                *stats_handler.stats_cache.lock().unwrap() =
-                    Some(BalloonStatsSnapshot { stats, last_update });
-            }
-            Err(error) => warn!("Ignoring invalid balloon statistics: {error}"),
-        }
-
-        match mem::replace(
-            &mut stats_handler.state,
+        let state = mem::replace(
+            &mut self.stats_handler.as_mut().unwrap().state,
             BalloonStatsState::Idle { descriptor_index },
-        ) {
-            BalloonStatsState::WaitingForInitialDescriptor | BalloonStatsState::Pending => {}
+        );
+
+        match state {
+            BalloonStatsState::WaitingForInitialDescriptor => {}
+            BalloonStatsState::PendingWaitingForInitialDescriptor { request } => {
+                self.queues[queue_index]
+                    .add_used(self.mem.memory().deref(), descriptor_index, 0)
+                    .map_err(Error::QueueAddUsed)?;
+                self.stats_handler.as_mut().unwrap().state = BalloonStatsState::Pending { request };
+                self.signal(VirtioInterruptType::Queue(queue_index as u16))?;
+            }
+            BalloonStatsState::Pending { request } => {
+                let result =
+                    Self::parse_stats_descriptor(&mut desc_chain, self.access_platform.as_deref())
+                        .map(|stats| {
+                            let last_update = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |duration| {
+                                    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                                });
+                            BalloonStatsSnapshot { stats, last_update }
+                        });
+                request.complete(result);
+            }
             BalloonStatsState::Idle { .. } => unreachable!(),
         }
+
         Ok(())
     }
 
-    fn process_stats_request(&mut self) -> result::Result<(), Error> {
+    fn process_stats_request(&mut self, request: StatsRequest) -> result::Result<(), Error> {
         let (queue_index, descriptor_index) = {
             let stats_handler = self.stats_handler.as_mut().unwrap();
-            match &mut stats_handler.state {
-                BalloonStatsState::WaitingForInitialDescriptor => return Ok(()),
+            match &stats_handler.state {
+                BalloonStatsState::WaitingForInitialDescriptor => {
+                    stats_handler.state =
+                        BalloonStatsState::PendingWaitingForInitialDescriptor { request };
+                    return Ok(());
+                }
                 BalloonStatsState::Idle { descriptor_index } => {
                     (stats_handler.queue_index, *descriptor_index)
                 }
-                BalloonStatsState::Pending => return Ok(()),
+                BalloonStatsState::PendingWaitingForInitialDescriptor { .. }
+                | BalloonStatsState::Pending { .. } => unreachable!(),
             }
         };
 
         self.queues[queue_index]
             .add_used(self.mem.memory().deref(), descriptor_index, 0)
             .map_err(Error::QueueAddUsed)?;
-        self.stats_handler.as_mut().unwrap().state = BalloonStatsState::Pending;
+        self.stats_handler.as_mut().unwrap().state = BalloonStatsState::Pending { request };
         self.signal(VirtioInterruptType::Queue(queue_index as u16))?;
 
         Ok(())
@@ -717,19 +779,19 @@ impl EpollHelperHandler for BalloonEpollHandler {
                     ))
                 })?;
 
-                while self
+                while let Ok(request) = self
                     .stats_handler
                     .as_mut()
                     .unwrap()
                     .request_receiver
                     .try_recv()
-                    .is_ok()
-                {}
-                self.process_stats_request().map_err(|e| {
-                    EpollHelperError::HandleEvent(anyhow!(
-                        "Failed to request balloon statistics: {e:?}"
-                    ))
-                })?;
+                {
+                    self.process_stats_request(request).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to request balloon statistics: {e:?}"
+                        ))
+                    })?;
+                }
             }
             REPORTING_QUEUE_EVENT => {
                 if let Some(reporting_queue_evt) = self.reporting_queue_evt.as_ref() {
@@ -776,8 +838,8 @@ pub struct Balloon {
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     stats_request_evt: EventFd,
-    stats_request_sender: Option<Sender<()>>,
-    stats_cache: BalloonStatsCache,
+    stats_request_sender: Option<Sender<StatsRequest>>,
+    stats_request_pending: Arc<AtomicBool>,
 }
 
 impl Balloon {
@@ -852,7 +914,7 @@ impl Balloon {
             exit_evt,
             stats_request_evt,
             stats_request_sender: None,
-            stats_cache: Arc::new(Mutex::new(None)),
+            stats_request_pending: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -869,34 +931,25 @@ impl Balloon {
         (self.config.actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
     }
 
-    fn request_stats_refresh(&self) -> Result<(), Error> {
+    pub fn begin_stats_request(&self) -> Result<Receiver<BalloonStatsRequestResult>, Error> {
+        if !self.common.feature_acked(VIRTIO_BALLOON_F_STATS_VQ) {
+            return Err(Error::StatsNotNegotiated);
+        }
         let request_sender = self
             .stats_request_sender
             .as_ref()
             .ok_or(Error::StatsWorkerUnavailable)?;
+        let (request, response_receiver) =
+            StatsRequest::try_new(Arc::clone(&self.stats_request_pending))
+                .ok_or(Error::StatsRequestPending)?;
         request_sender
-            .send(())
+            .send(request)
             .map_err(|_| Error::StatsWorkerUnavailable)?;
         self.stats_request_evt
             .write(1)
-            .map_err(Error::StatsRequestSignal)
-    }
+            .map_err(Error::StatsRequestSignal)?;
 
-    // Return the latest statistics and request an asynchronous refresh.
-    pub fn stats(&self) -> Result<BalloonStatsSnapshot, Error> {
-        if !self.common.feature_acked(VIRTIO_BALLOON_F_STATS_VQ) {
-            return Err(Error::StatsNotNegotiated);
-        }
-        let stats = self.stats_cache.lock().unwrap().clone();
-
-        if let Err(error) = self.request_stats_refresh() {
-            if stats.is_none() {
-                return Err(error);
-            }
-            warn!("Failed to refresh balloon statistics: {error}");
-        }
-
-        Ok(stats.unwrap_or_default())
+        Ok(response_receiver)
     }
 
     fn state(&self) -> BalloonState {
@@ -974,7 +1027,6 @@ impl VirtioDevice for Balloon {
             device_status,
         } = context;
         self.common.activate(&queues, interrupt_cb.clone())?;
-        *self.stats_cache.lock().unwrap() = None;
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
 
         let mut virtqueues = Vec::new();
@@ -1004,7 +1056,6 @@ impl VirtioDevice for Balloon {
                     queue_index: qi,
                     request_evt,
                     request_receiver,
-                    stats_cache: Arc::clone(&self.stats_cache),
                     state: BalloonStatsState::WaitingForInitialDescriptor,
                 })
             } else {
@@ -1068,7 +1119,6 @@ impl VirtioDevice for Balloon {
     fn reset(&mut self) {
         self.stats_request_sender = None;
         self.common.reset();
-        *self.stats_cache.lock().unwrap() = None;
         event!("virtio-device", "reset", "id", &self.id);
     }
 }
@@ -1139,7 +1189,6 @@ mod tests {
                 queue_index: 0,
                 request_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
                 request_receiver,
-                stats_cache: Arc::new(Mutex::new(None)),
                 state,
             }),
             reporting_queue_evt: None,
@@ -1149,6 +1198,17 @@ mod tests {
             pbp: None,
             access_platform: None,
         }
+    }
+
+    fn create_stats_request() -> (
+        StatsRequest,
+        Receiver<BalloonStatsRequestResult>,
+        Arc<AtomicBool>,
+    ) {
+        let pending = Arc::new(AtomicBool::new(false));
+        let (request, response_receiver) = StatsRequest::try_new(Arc::clone(&pending)).unwrap();
+
+        (request, response_receiver, pending)
     }
 
     fn stat(tag: u16, value: u64) -> Vec<u8> {
@@ -1213,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_require_negotiated_feature() {
+    fn stats_request_requires_negotiated_feature() {
         let balloon = Balloon::new(
             "balloon0".to_string(),
             0,
@@ -1226,11 +1286,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(balloon.stats(), Err(Error::StatsNotNegotiated)));
+        assert!(matches!(
+            balloon.begin_stats_request(),
+            Err(Error::StatsNotNegotiated)
+        ));
     }
 
     #[test]
-    fn stats_request_refresh_before_initial_sample() {
+    fn stats_request_rejects_pending_request() {
         let mut balloon = Balloon::new(
             "balloon0".to_string(),
             0,
@@ -1246,73 +1309,20 @@ mod tests {
         let (request_sender, request_receiver) = mpsc::channel();
         balloon.stats_request_sender = Some(request_sender);
 
-        assert_eq!(balloon.stats().unwrap(), BalloonStatsSnapshot::default());
-        assert_eq!(request_receiver.try_recv(), Ok(()));
+        let response_receiver = balloon.begin_stats_request().unwrap();
+        drop(response_receiver);
+
+        assert!(matches!(
+            balloon.begin_stats_request(),
+            Err(Error::StatsRequestPending)
+        ));
+
+        drop(request_receiver.try_recv().unwrap());
+        balloon.begin_stats_request().unwrap();
     }
 
     #[test]
-    fn stats_return_cached_sample_while_requesting_refresh() {
-        let mut balloon = Balloon::new(
-            "balloon0".to_string(),
-            0,
-            false,
-            false,
-            false,
-            SeccompAction::Allow,
-            EventFd::new(EFD_NONBLOCK).unwrap(),
-            None,
-        )
-        .unwrap();
-        balloon.common.acked_features = 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
-        let (request_sender, request_receiver) = mpsc::channel();
-        balloon.stats_request_sender = Some(request_sender);
-        let cached = BalloonStatsSnapshot {
-            stats: BalloonStats {
-                free_memory: Some(100),
-                ..Default::default()
-            },
-            last_update: 1,
-        };
-        *balloon.stats_cache.lock().unwrap() = Some(cached.clone());
-
-        assert_eq!(balloon.stats().unwrap(), cached);
-        assert_eq!(request_receiver.try_recv(), Ok(()));
-
-        assert_eq!(balloon.stats().unwrap(), cached);
-        assert_eq!(request_receiver.try_recv(), Ok(()));
-    }
-
-    #[test]
-    fn stats_return_cached_sample_if_refresh_worker_is_unavailable() {
-        let mut balloon = Balloon::new(
-            "balloon0".to_string(),
-            0,
-            false,
-            false,
-            false,
-            SeccompAction::Allow,
-            EventFd::new(EFD_NONBLOCK).unwrap(),
-            None,
-        )
-        .unwrap();
-        balloon.common.acked_features = 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
-        let (request_sender, request_receiver) = mpsc::channel();
-        drop(request_receiver);
-        balloon.stats_request_sender = Some(request_sender);
-        let cached = BalloonStatsSnapshot {
-            stats: BalloonStats {
-                free_memory: Some(100),
-                ..Default::default()
-            },
-            last_update: 1,
-        };
-        *balloon.stats_cache.lock().unwrap() = Some(cached.clone());
-
-        assert_eq!(balloon.stats().unwrap(), cached);
-    }
-
-    #[test]
-    fn stats_queue_caches_initial_and_refreshed_descriptors() {
+    fn stats_request_returns_replacement_descriptor() {
         const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
         const STATS_ADDRESS: GuestAddress = GuestAddress(0x1_000);
 
@@ -1329,38 +1339,12 @@ mod tests {
             guest_queue.create_queue(),
             BalloonStatsState::WaitingForInitialDescriptor,
         );
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
         handler.process_stats_queue().unwrap();
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let initial_snapshot = handler
-            .stats_handler
-            .as_ref()
-            .unwrap()
-            .stats_cache
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap();
-        assert_eq!(initial_snapshot.stats.free_memory, Some(100));
-        assert!((before..=after).contains(&u128::from(initial_snapshot.last_update)));
-        assert!(matches!(
-            &handler.stats_handler.as_ref().unwrap().state,
-            BalloonStatsState::Idle {
-                descriptor_index: 0
-            }
-        ));
+        assert_eq!(guest_queue.used.idx.get(), 0);
 
-        handler.process_stats_request().unwrap();
-        assert!(matches!(
-            &handler.stats_handler.as_ref().unwrap().state,
-            BalloonStatsState::Pending
-        ));
+        let (request, response_receiver, _) = create_stats_request();
+        handler.process_stats_request(request).unwrap();
+        assert_eq!(guest_queue.used.idx.get(), 1);
 
         let refreshed = stat(VIRTIO_BALLOON_S_MEMFREE, 200);
         memory.write_slice(&refreshed, STATS_ADDRESS).unwrap();
@@ -1368,17 +1352,9 @@ mod tests {
         guest_queue.avail.idx.set(2);
         handler.process_stats_queue().unwrap();
 
-        let refreshed_snapshot = handler
-            .stats_handler
-            .as_ref()
-            .unwrap()
-            .stats_cache
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap();
-        assert_eq!(refreshed_snapshot.stats.free_memory, Some(200));
-        assert!(refreshed_snapshot.last_update >= initial_snapshot.last_update);
+        let snapshot = response_receiver.try_recv().unwrap().unwrap();
+        assert_eq!(snapshot.stats.free_memory, Some(200));
+        assert!(snapshot.last_update > 0);
         assert!(matches!(
             &handler.stats_handler.as_ref().unwrap().state,
             BalloonStatsState::Idle {
@@ -1388,56 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_queue_does_not_consume_descriptor_while_idle() {
-        const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
-        const STATS_ADDRESS: GuestAddress = GuestAddress(0x1_000);
-
-        let memory = TestMemory::from_ranges(&[(GuestAddress(0), 0x2_0000)]).unwrap();
-        let guest_queue = VirtQueue::new(QUEUE_ADDRESS, &memory, 16);
-        guest_queue.dtable[0].set(STATS_ADDRESS.raw_value(), 10, 0, 0);
-        guest_queue.avail.ring[0].set(0);
-        guest_queue.avail.idx.set(1);
-        let mut handler = create_stats_handler(
-            &memory,
-            guest_queue.create_queue(),
-            BalloonStatsState::Idle {
-                descriptor_index: 1,
-            },
-        );
-
-        handler.process_stats_queue().unwrap();
-
-        assert_eq!(handler.queues[0].next_avail(), 0);
-        assert!(matches!(
-            &handler.stats_handler.as_ref().unwrap().state,
-            BalloonStatsState::Idle {
-                descriptor_index: 1
-            }
-        ));
-    }
-
-    #[test]
-    fn stats_request_is_ignored_while_refresh_is_pending() {
-        const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
-
-        let memory = TestMemory::from_ranges(&[(GuestAddress(0), 0x2_0000)]).unwrap();
-        let guest_queue = VirtQueue::new(QUEUE_ADDRESS, &memory, 16);
-        let mut handler = create_stats_handler(
-            &memory,
-            guest_queue.create_queue(),
-            BalloonStatsState::Pending,
-        );
-
-        handler.process_stats_request().unwrap();
-
-        assert!(matches!(
-            &handler.stats_handler.as_ref().unwrap().state,
-            BalloonStatsState::Pending
-        ));
-    }
-
-    #[test]
-    fn stats_request_before_initial_descriptor_is_ignored() {
+    fn stats_request_waits_for_initial_descriptor() {
         const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
         const STATS_ADDRESS: GuestAddress = GuestAddress(0x1_000);
 
@@ -1449,11 +1376,16 @@ mod tests {
             BalloonStatsState::WaitingForInitialDescriptor,
         );
 
-        handler.process_stats_request().unwrap();
+        let (request, response_receiver, _) = create_stats_request();
+        handler.process_stats_request(request).unwrap();
         assert!(matches!(
             &handler.stats_handler.as_ref().unwrap().state,
-            BalloonStatsState::WaitingForInitialDescriptor
+            BalloonStatsState::PendingWaitingForInitialDescriptor { .. }
         ));
+        assert_eq!(
+            response_receiver.try_recv().unwrap_err(),
+            mpsc::TryRecvError::Empty
+        );
 
         let initial = stat(VIRTIO_BALLOON_S_MEMFREE, 100);
         memory.write_slice(&initial, STATS_ADDRESS).unwrap();
@@ -1463,47 +1395,59 @@ mod tests {
         handler.process_stats_queue().unwrap();
         assert!(matches!(
             &handler.stats_handler.as_ref().unwrap().state,
-            BalloonStatsState::Idle {
-                descriptor_index: 0
-            }
+            BalloonStatsState::Pending { .. }
         ));
         assert_eq!(
-            handler
-                .stats_handler
-                .as_ref()
-                .unwrap()
-                .stats_cache
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .stats
-                .free_memory,
-            Some(100)
+            response_receiver.try_recv().unwrap_err(),
+            mpsc::TryRecvError::Empty
         );
+
+        let refreshed = stat(VIRTIO_BALLOON_S_MEMFREE, 200);
+        memory.write_slice(&refreshed, STATS_ADDRESS).unwrap();
+        guest_queue.avail.ring[1].set(0);
+        guest_queue.avail.idx.set(2);
+        handler.process_stats_queue().unwrap();
+
+        let snapshot = response_receiver.try_recv().unwrap().unwrap();
+        assert_eq!(snapshot.stats.free_memory, Some(200));
+        assert!(snapshot.last_update > 0);
     }
 
     #[test]
-    fn stats_request_propagates_queue_error() {
+    fn stats_request_remains_pending_after_caller_timeout() {
         const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
+        const STATS_ADDRESS: GuestAddress = GuestAddress(0x1_000);
 
         let memory = TestMemory::from_ranges(&[(GuestAddress(0), 0x2_0000)]).unwrap();
         let guest_queue = VirtQueue::new(QUEUE_ADDRESS, &memory, 16);
+        let initial = stat(VIRTIO_BALLOON_S_MEMFREE, 100);
+        memory.write_slice(&initial, STATS_ADDRESS).unwrap();
+        guest_queue.dtable[0].set(STATS_ADDRESS.raw_value(), initial.len() as u32, 0, 0);
+        guest_queue.avail.ring[0].set(0);
+        guest_queue.avail.idx.set(1);
         let mut handler = create_stats_handler(
             &memory,
             guest_queue.create_queue(),
-            BalloonStatsState::Idle {
-                descriptor_index: 16,
-            },
+            BalloonStatsState::WaitingForInitialDescriptor,
         );
-        assert!(matches!(
-            handler.process_stats_request(),
-            Err(Error::QueueAddUsed(_))
-        ));
+        handler.process_stats_queue().unwrap();
+
+        let (request, response_receiver, pending) = create_stats_request();
+        handler.process_stats_request(request).unwrap();
+        drop(response_receiver);
+        assert!(StatsRequest::try_new(Arc::clone(&pending)).is_none());
+
+        let refreshed = stat(VIRTIO_BALLOON_S_MEMFREE, 200);
+        memory.write_slice(&refreshed, STATS_ADDRESS).unwrap();
+        guest_queue.avail.ring[1].set(0);
+        guest_queue.avail.idx.set(2);
+        handler.process_stats_queue().unwrap();
+
+        assert!(StatsRequest::try_new(pending).is_some());
     }
 
     #[test]
-    fn invalid_stats_do_not_replace_cached_sample() {
+    fn stats_request_rejects_invalid_guest_address() {
         const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
         const INVALID_STATS_ADDRESS: GuestAddress = GuestAddress(0x3_0000);
 
@@ -1512,36 +1456,22 @@ mod tests {
         guest_queue.dtable[0].set(INVALID_STATS_ADDRESS.raw_value(), 10, 0, 0);
         guest_queue.avail.ring[0].set(0);
         guest_queue.avail.idx.set(1);
+        let (request, response_receiver, _) = create_stats_request();
         let mut handler = create_stats_handler(
             &memory,
             guest_queue.create_queue(),
-            BalloonStatsState::Pending,
+            BalloonStatsState::Pending { request },
         );
-        let cached = BalloonStatsSnapshot {
-            stats: BalloonStats {
-                free_memory: Some(100),
-                ..Default::default()
-            },
-            last_update: 1,
-        };
-        *handler
-            .stats_handler
-            .as_ref()
-            .unwrap()
-            .stats_cache
-            .lock()
-            .unwrap() = Some(cached.clone());
 
         handler.process_stats_queue().unwrap();
-        assert_eq!(
-            *handler
-                .stats_handler
-                .as_ref()
-                .unwrap()
-                .stats_cache
-                .lock()
-                .unwrap(),
-            Some(cached)
-        );
+        assert!(matches!(
+            response_receiver.try_recv().unwrap(),
+            Err(BalloonStatsError::InvalidDescriptor(address))
+                if address == INVALID_STATS_ADDRESS.raw_value()
+        ));
+        assert!(matches!(
+            &handler.stats_handler.as_ref().unwrap().state,
+            BalloonStatsState::Idle { .. }
+        ));
     }
 }

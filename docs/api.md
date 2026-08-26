@@ -173,7 +173,7 @@ curl --unix-socket /tmp/cloud-hypervisor.sock -i \
 ##### Get Balloon Statistics
 
 When the running VM has negotiated the virtio-balloon statistics feature, the
-most recently reported guest sample can be retrieved with:
+statistics can be requested with:
 
 ```shell
 curl --unix-socket /tmp/cloud-hypervisor.sock -i \
@@ -181,11 +181,11 @@ curl --unix-socket /tmp/cloud-hypervisor.sock -i \
      -H 'Accept: application/json'
 ```
 
-The same request is available through `ch-remote balloon-stats`. Reading the
-statistics also requests an asynchronous refresh for the next call. The
-`last_update` field is a host-generated UNIX timestamp in milliseconds, or zero
-if the guest has not supplied its first sample yet. Unsupported guest
-statistics are omitted from the response.
+The same request is available through `ch-remote balloon-stats`. Cloud
+Hypervisor waits up to one second for a fresh guest response. The `last_update`
+field is a host-generated UNIX timestamp in milliseconds recording when that
+response was received. Unsupported guest statistics are omitted from the
+response.
 
 ##### Reboot a Virtual Machine
 

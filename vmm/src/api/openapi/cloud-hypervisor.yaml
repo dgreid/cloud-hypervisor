@@ -56,14 +56,16 @@ paths:
 
   /vm.balloon-stats:
     get:
-      summary: Get cached statistics from the virtio-balloon device
+      summary: Get memory statistics from the virtio-balloon device
       responses:
         200:
-          description: Most recently reported virtio-balloon statistics
+          description: Virtio-balloon statistics reported by the guest
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/BalloonStatsResponse"
+        429:
+          description: A virtio-balloon statistics request is already pending.
         500:
           description: The statistics could not be retrieved, e.g. the statistics feature was not negotiated with the guest driver.
 
@@ -652,11 +654,11 @@ components:
         balloon_actual:
           type: integer
           format: int64
-          description: Current balloon size in bytes
+          description: Current balloon size in bytes.
         last_update:
           type: integer
           format: int64
-          description: Host UNIX timestamp in milliseconds when statistics were last updated, or zero before the first sample
+          description: Host UNIX timestamp in milliseconds when the returned sample was received
         stats:
           $ref: "#/components/schemas/BalloonStats"
 

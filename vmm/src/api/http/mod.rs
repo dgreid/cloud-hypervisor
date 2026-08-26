@@ -22,6 +22,7 @@ use micro_http::{
 use seccompiler::{SeccompAction, apply_filter};
 use serde_json::Error as SerdeError;
 use thiserror::Error;
+use virtio_devices::balloon::Error as BalloonError;
 use vmm_sys_util::eventfd::EventFd;
 
 use self::http_endpoint::{
@@ -93,6 +94,9 @@ impl HttpError {
 /// Maps an [`ApiError`] to an HTTP [`StatusCode`].
 fn api_error_status_code(error: &ApiError) -> StatusCode {
     match error.source().and_then(|e| e.downcast_ref::<VmError>()) {
+        Some(VmError::DeviceManager(DeviceManagerError::VirtioBalloonStats(
+            BalloonError::StatsRequestPending,
+        ))) => StatusCode::TooManyRequests,
         Some(
             VmError::VmNotCreated
             | VmError::VmMissingConfig
@@ -588,6 +592,15 @@ mod tests {
             ))),
             StatusCode::BadRequest
         );
+    }
+
+    #[test]
+    fn test_pending_balloon_stats_maps_to_too_many_requests() {
+        let error = ApiError::VmBalloonStats(VmError::DeviceManager(
+            DeviceManagerError::VirtioBalloonStats(BalloonError::StatsRequestPending),
+        ));
+
+        assert_eq!(api_error_status_code(&error), StatusCode::TooManyRequests);
     }
 
     #[test]

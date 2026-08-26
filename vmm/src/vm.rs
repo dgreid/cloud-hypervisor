@@ -95,7 +95,7 @@ use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 use crate::coredump::{
     CpuElf64Writable, DumpState, Elf64Writable, GuestDebuggable, GuestDebuggableError, NoteDescType,
 };
-use crate::device_manager::{DeviceManager, DeviceManagerError};
+use crate::device_manager::{BalloonStatsRequest, DeviceManager, DeviceManagerError};
 use crate::device_tree::DeviceTree;
 #[cfg(feature = "guest_debug")]
 use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayload};
@@ -3031,11 +3031,11 @@ impl Vm {
         self.device_manager.lock().unwrap().balloon_size()
     }
 
-    pub fn balloon_stats(&self) -> Result<virtio_devices::BalloonStatsSnapshot> {
+    pub fn request_balloon_stats(&self) -> Result<BalloonStatsRequest> {
         self.device_manager
             .lock()
             .unwrap()
-            .balloon_stats()
+            .request_balloon_stats()
             .map_err(Error::DeviceManager)
     }
 

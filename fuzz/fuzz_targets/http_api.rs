@@ -14,8 +14,8 @@ use micro_http::Request;
 use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{
-    ApiRequest, BalloonStatsResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
-    VmSendMigrationData, VmmPingResponse,
+    ApiRequest, PendingBalloonStatsResponse, RequestHandler, VmInfoResponse,
+    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
 use vmm::vm::{Error as VmError, VmState};
@@ -222,12 +222,9 @@ impl RequestHandler for StubApiRequestHandler {
         })
     }
 
-    fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError> {
-        Ok(BalloonStatsResponse {
-            balloon_actual: 0,
-            last_update: 0,
-            stats: Default::default(),
-        })
+    fn vm_balloon_stats(&self) -> Result<PendingBalloonStatsResponse, VmError> {
+        // There is no balloon worker to complete a pending response.
+        Err(VmError::VmNotRunning)
     }
 
     fn vmm_ping(&self) -> VmmPingResponse {

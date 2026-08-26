@@ -48,8 +48,8 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
-    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, MigrationMode, PendingBalloonStatsResponse, RequestHandler,
+    TimeoutStrategy, VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -2706,16 +2706,11 @@ impl RequestHandler for Vmm {
         })
     }
 
-    fn vm_balloon_stats(&self) -> result::Result<BalloonStatsResponse, VmError> {
+    fn vm_balloon_stats(&self) -> result::Result<PendingBalloonStatsResponse, VmError> {
         match &self.vm {
-            VmOwnership::Owned(vm) if vm.get_state() == VmState::Running => {
-                let snapshot = vm.balloon_stats()?;
-                Ok(BalloonStatsResponse {
-                    balloon_actual: vm.balloon_size(),
-                    last_update: snapshot.last_update,
-                    stats: snapshot.stats,
-                })
-            }
+            VmOwnership::Owned(vm) if vm.get_state() == VmState::Running => Ok(
+                PendingBalloonStatsResponse::new(vm.request_balloon_stats()?),
+            ),
             VmOwnership::Owned(_) | VmOwnership::None => Err(VmError::VmNotRunning),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
         }

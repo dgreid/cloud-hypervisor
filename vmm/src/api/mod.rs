@@ -57,6 +57,7 @@ use crate::Error as VmmError;
 use crate::config::{
     RestoreConfig, RestoredVfioConfig, VmMemoryZoneUpdateData, deserialize_restored_fd,
 };
+use crate::device_manager::BalloonStatsRequest;
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
@@ -239,6 +240,26 @@ pub struct BalloonStatsResponse {
     pub balloon_actual: u64,
     pub last_update: u64,
     pub stats: virtio_devices::BalloonStats,
+}
+
+pub struct PendingBalloonStatsResponse {
+    request: BalloonStatsRequest,
+}
+
+impl PendingBalloonStatsResponse {
+    pub(crate) fn new(request: BalloonStatsRequest) -> Self {
+        Self { request }
+    }
+
+    fn wait(self, timeout: Duration) -> Result<BalloonStatsResponse, VmError> {
+        let (balloon_actual, snapshot) =
+            self.request.wait(timeout).map_err(VmError::DeviceManager)?;
+        Ok(BalloonStatsResponse {
+            balloon_actual,
+            last_update: snapshot.last_update,
+            stats: snapshot.stats,
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -848,8 +869,8 @@ pub enum ApiResponsePayload {
     /// Virtual machine information
     VmInfo(VmInfoResponse),
 
-    /// Virtio-balloon statistics
-    VmBalloonStats(Box<BalloonStatsResponse>),
+    /// Pending virtio-balloon statistics
+    VmBalloonStats(PendingBalloonStatsResponse),
 
     /// Vmm ping response
     VmmPing(VmmPingResponse),
@@ -883,7 +904,7 @@ pub trait RequestHandler {
 
     fn vm_info(&self) -> Result<VmInfoResponse, VmError>;
 
-    fn vm_balloon_stats(&self) -> Result<BalloonStatsResponse, VmError>;
+    fn vm_balloon_stats(&self) -> Result<PendingBalloonStatsResponse, VmError>;
 
     fn vmm_ping(&self) -> VmmPingResponse;
 
@@ -1459,7 +1480,6 @@ impl ApiAction for VmBalloonStats {
             let response = vmm
                 .vm_balloon_stats()
                 .map_err(ApiError::VmBalloonStats)
-                .map(Box::new)
                 .map(ApiResponsePayload::VmBalloonStats);
 
             response_sender
@@ -1476,8 +1496,12 @@ impl ApiAction for VmBalloonStats {
         api_sender: Sender<ApiRequest>,
         data: Self::RequestBody,
     ) -> ApiResult<Self::ResponseBody> {
+        const STATS_TIMEOUT: Duration = Duration::from_secs(1);
+
         match get_response(self, api_evt, api_sender, data)? {
-            ApiResponsePayload::VmBalloonStats(stats) => Ok(*stats),
+            ApiResponsePayload::VmBalloonStats(response) => response
+                .wait(STATS_TIMEOUT)
+                .map_err(ApiError::VmBalloonStats),
             _ => Err(ApiError::ResponsePayloadType),
         }
     }
@@ -2200,7 +2224,7 @@ mod unit_tests {
     }
 
     #[test]
-    fn test_balloon_stats_response_omits_unsupported_stats() {
+    fn balloon_stats_response_omits_unsupported_stats() {
         let response = BalloonStatsResponse {
             balloon_actual: 4096,
             last_update: 1234,

@@ -81,7 +81,7 @@ Cloud Hypervisor offers the virtio statistics queue whenever a balloon device
 is configured. The guest must negotiate `VIRTIO_BALLOON_F_STATS_VQ` before
 statistics can be queried.
 
-Use `ch-remote` to retrieve the most recently reported sample:
+Use `ch-remote` to request statistics from the guest:
 
 ```
 ch-remote --api-socket=/path/to/api.sock balloon-stats
@@ -94,8 +94,6 @@ omitted from the response. In addition to the statistics from the virtio 1.4
 specification, Cloud Hypervisor recognizes the Linux OOM, allocation stall,
 scan, and reclaim statistics.
 
-Cloud Hypervisor caches the latest sample and returns it immediately. Each
-request also asks the guest to refresh the cache asynchronously for the next
-request. If the guest stops responding, `last_update` indicates the age of the
-cached sample. Before the first sample arrives, `last_update` is zero and
-`stats` is empty.
+Cloud Hypervisor waits up to one second for the guest response. A request that
+times out continues to own the in-flight descriptor until the guest responds
+or the device is reset, so another request may temporarily return HTTP 429.

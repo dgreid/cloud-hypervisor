@@ -5345,27 +5345,12 @@ mod common_parallel {
                 serde_json::from_slice(&output).ok()
             };
 
-            let initial_last_update = Cell::new(0);
             assert!(wait_until(Duration::from_secs(20), || {
-                let Some(response) = balloon_stats() else {
-                    return false;
-                };
-                if response.balloon_actual != 0
-                    || response.last_update == 0
-                    || response.stats.total_memory.unwrap_or_default() == 0
-                {
-                    return false;
-                }
-
-                initial_last_update.set(response.last_update);
-                true
-            }));
-
-            // The API returns the cached sample and requests a refresh for the
-            // next call.
-            assert!(wait_until(Duration::from_secs(20), || {
-                balloon_stats()
-                    .is_some_and(|response| response.last_update > initial_last_update.get())
+                balloon_stats().is_some_and(|response| {
+                    response.balloon_actual == 0
+                        && response.last_update > 0
+                        && response.stats.total_memory.unwrap_or_default() > 0
+                })
             }));
         });
 
